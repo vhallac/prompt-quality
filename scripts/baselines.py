@@ -467,6 +467,50 @@ JEV_QUESTIONS = {
 }
 
 
+def jev_questions_sha256(questions: dict | None = None) -> str:
+    """Digest of the questions payload a jev request carries.
+
+    Canonicalised with sorted keys, so the digest is stable across runs and
+    across dict key insertion order, while any change to the rubric text, the
+    criteria, or the set of questions changes it. Decision 008 requires the
+    cache key to cover the whole request payload; review F2 found the questions
+    were the one payload field the key left out.
+    """
+    payload = json.dumps(questions or JEV_QUESTIONS, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+JEV_QUESTIONS_SHA256 = jev_questions_sha256()
+
+# The shipped jev cache predates questions-keyed entries, so its file records
+# no digest of its own. The question set that produced it is a fact of git
+# history: JEV_QUESTIONS was introduced at 6635d82 and has not been edited in
+# any commit since, and dataset/jev-cache.json was first committed at 567c8be.
+# That payload digest is therefore pinned here as the unrecorded cache's
+# provenance. Editing the rubric changes JEV_QUESTIONS_SHA256 without changing
+# this constant, and the adoption path below closes: the paid entries become
+# unreachable (a miss, and without an API key a loud failure) instead of
+# answering questions they were never asked. Re-derive it from git and change
+# it only to re-stamp a pre-metadata cache file deliberately.
+JEV_CACHE_LEGACY_QUESTIONS_SHA256 = (
+    "0af0518d16be199ccb22ab4d60d159269dd5a555dc55c0cb15f2510cab2c6c69"
+)
+
+# Reserved member of the cache document. Every cache key is a 64-hex digest, so
+# this name cannot collide with one; storing it beside the entries keeps the
+# file a single flat JSON object and its diff to one added line.
+JEV_CACHE_QUESTIONS_KEY = "__questions_sha256__"
+
+
+class JevCacheError(RuntimeError):
+    """The jev cache file exists but cannot be read as a cache.
+
+    Raised with the path in the message (review F8): silently treating a
+    half-written or hand-edited cache as cold would discard paid answers and
+    re-bill for them without telling anyone.
+    """
+
+
 def _own_response_text(round_data: dict) -> str:
     """Own-response text as jev-round-scan.py's build_state extracts it
     (responseSequence is a plain string in current round files, but the
@@ -538,7 +582,19 @@ def query_jev(
 ) -> dict:
     """One decisions-API call, in the shape of jev-round-scan.py's
     query_jev. Raises on network/HTTP errors or an unexpected response
-    shape (the caller applies the retry/exclusion policy)."""
+    shape (the caller applies the retry/exclusion policy).
+
+    Raises without touching the network when no key is configured: a cache
+    miss then says "no API key" once instead of recording every row as an
+    api_error after a hundred futile requests (review F2's miss path). A
+    RuntimeError, so it is not swallowed by the retry policy.
+    """
+    if not api_key:
+        raise RuntimeError(
+            "jev cache miss and no API key configured: set OPENROUTER_API_KEY "
+            "(or pass --api-key), or warm the jev cache (--cache, "
+            "PROMPT_QUALITY_JEV_CACHE)"
+        )
     payload = json.dumps(
         {"model": JEV_MODEL, "state": state, "questions": questions or JEV_QUESTIONS}
     ).encode()
@@ -559,8 +615,31 @@ def query_jev(
     return answers
 
 
-def jev_cache_key(state: str, model: str = JEV_MODEL) -> str:
-    """Stable cache key for one jev request (sample-base-rate.py pattern)."""
+def jev_cache_key(
+    state: str,
+    model: str = JEV_MODEL,
+    questions_sha256: str = JEV_QUESTIONS_SHA256,
+) -> str:
+    """Cache key for one jev request: state, model, and the question payload.
+
+    Payload-complete in the sense of decision 008 — every input that can change
+    the answer is in the key, the questions as their digest so the key stays a
+    fixed-width hex (review F2).
+    """
+    h = hashlib.sha256()
+    for part in (state, model, questions_sha256):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def jev_cache_key_legacy(state: str, model: str = JEV_MODEL) -> str:
+    """The pre-F2 ``(state, model)`` key.
+
+    Read only by the adoption path in ``rescore_rows`` and never written, so a
+    cache file written by this code addresses its entries by the full payload
+    alone (unit-005's output contract).
+    """
     h = hashlib.sha256()
     for part in (state, model):
         h.update(part.encode("utf-8"))
@@ -568,22 +647,119 @@ def jev_cache_key(state: str, model: str = JEV_MODEL) -> str:
     return h.hexdigest()
 
 
+def jev_cache_questions_sha256(cache: dict[str, str]) -> str | None:
+    """The question-set digest recorded for this cache, if the file stated one."""
+    value = cache.get(JEV_CACHE_QUESTIONS_KEY)
+    return value if isinstance(value, str) else None
+
+
+def jev_cache_entry_count(cache: dict[str, str]) -> int:
+    """Answer count, ignoring the reserved questions-digest member."""
+    return sum(1 for key in cache if key != JEV_CACHE_QUESTIONS_KEY)
+
+
+def jev_legacy_adoption_allowed(
+    cache: dict[str, str], questions_sha256: str
+) -> bool:
+    """May ``(state, model)``-keyed entries answer this question set?
+
+    Only when the digest recorded for the cache is the digest in force. A file
+    that recorded nothing is read through the legacy key only while the payload
+    in force still digests to the pinned provenance of the shipped cache.
+    """
+    recorded = jev_cache_questions_sha256(cache)
+    if recorded is None:
+        recorded = JEV_CACHE_LEGACY_QUESTIONS_SHA256
+    return recorded == questions_sha256
+
+
+def _is_cache_digest(key: str) -> bool:
+    """A cache key is a sha256 hex digest — nothing else belongs in the map."""
+    return len(key) == 64 and all(c in "0123456789abcdef" for c in key)
+
+
+def _jev_cache_entries(doc: dict, path: Path) -> dict[str, str]:
+    """Validate the loaded document's shape and return it.
+
+    Every entry value is parsed as JSON here rather than at lookup, so a
+    corrupt answer names the file and the key instead of raising from the
+    middle of a scored run.
+    """
+    for key, value in doc.items():
+        if key == JEV_CACHE_QUESTIONS_KEY:
+            if not isinstance(value, str) or not _is_cache_digest(value):
+                raise JevCacheError(
+                    f"jev cache {path} records {value!r} as its questions digest, "
+                    "which is not a sha256 hex digest"
+                )
+            continue
+        if not _is_cache_digest(key):
+            raise JevCacheError(
+                f"jev cache {path} holds a key that is not a cache digest: {key!r}"
+            )
+        if not isinstance(value, str):
+            raise JevCacheError(f"jev cache {path} entry {key!r} is not a JSON string")
+        try:
+            answers = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise JevCacheError(
+                f"jev cache {path} entry {key!r} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(answers, dict):
+            raise JevCacheError(
+                f"jev cache {path} entry {key!r} does not hold a JSON object"
+            )
+    return doc
+
+
 def load_jev_cache(path: str | Path = JEV_CACHE_PATH) -> dict[str, str]:
-    """Load a ``{cache_key: answers-json}`` cache (empty if absent)."""
+    """Load a ``{cache_key: answers-json}`` cache; a cold start is an empty map.
+
+    Absent, empty, or whitespace-only → ``{}``: such a file holds no paid work
+    to lose. Non-empty but unreadable → ``JevCacheError`` naming the path: a
+    truncated or hand-edited cache may hold every answer this project has paid
+    for, and silently starting cold would re-bill for them (review F8).
+    """
     path = Path(path)
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return {}
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise JevCacheError(f"jev cache {path} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise JevCacheError(f"jev cache {path} must hold a JSON object")
+    return _jev_cache_entries(doc, path)
 
 
-def save_jev_cache(cache: dict[str, str], path: str | Path = JEV_CACHE_PATH) -> Path:
-    """Persist the cache deterministically (sorted keys, trailing newline)."""
+def save_jev_cache(
+    cache: dict[str, str],
+    path: str | Path = JEV_CACHE_PATH,
+    questions_sha256: str | None = None,
+) -> Path:
+    """Persist the cache deterministically (sorted keys, trailing newline).
+
+    Written through a temp file in the same directory and moved with
+    ``os.replace``, so a kill mid-save cannot leave the tracked cache truncated
+    (review F8). ``questions_sha256`` records the payload these entries answer;
+    it is what gates the legacy-key adoption path on the next load, so it is
+    written only when the caller states it.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(cache, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    doc = dict(cache)
+    if questions_sha256 is not None:
+        doc[JEV_CACHE_QUESTIONS_KEY] = questions_sha256
+    text = json.dumps(doc, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
 
 
@@ -605,8 +781,12 @@ def rescore_rows(
 
     Variants: 'prompt_only' (marker response), 'own_response' (the scan's
     leak shape), 'parent_response' (the refine shape). API results are
-    cached on disk (keyed like sample-base-rate.py); a cache hit makes the
-    run offline and deterministic.
+    cached on disk keyed on the whole request payload — state, model, and
+    the question set (decision 008, review F2); a cache hit makes the run
+    offline and deterministic. Entries written before the question set
+    joined the key are adopted under the payload-complete key, and only
+    while the digest recorded for that cache still matches the payload in
+    force: editing the rubric is a miss, never the old answers.
 
     Failure policy (issue #3 extensions 4a/4b): a round whose API call
     fails after JEV_MAX_RETRIES gets score null with reason 'api_error';
@@ -617,6 +797,8 @@ def rescore_rows(
     """
     if variant not in ("prompt_only", "own_response", "parent_response"):
         raise ValueError(f"unknown rescore variant {variant!r}")
+    questions_sha256 = jev_questions_sha256(questions)
+    adopt_legacy = jev_legacy_adoption_allowed(cache, questions_sha256)
     out: list[dict] = []
     for row in rows:
         rid = row["id"]
@@ -656,9 +838,18 @@ def rescore_rows(
                     continue
                 state = parent_response_state(prompt, parent)
         assert state is not None
-        key = jev_cache_key(state)
-        if key in cache:
-            answers = json.loads(cache[key])
+        key = jev_cache_key(state, questions_sha256=questions_sha256)
+        answers_json = cache.get(key)
+        if answers_json is None and adopt_legacy:
+            # Pre-F2 entry: same state, same model, and the gate above proved
+            # the same rubric, so it answers this exact question. Adopt it
+            # under the payload-complete key and drop the legacy key, leaving
+            # the file addressable by the full payload alone.
+            answers_json = cache.pop(jev_cache_key_legacy(state), None)
+            if answers_json is not None:
+                cache[key] = answers_json
+        if answers_json is not None:
+            answers = json.loads(answers_json)
         else:
             answers = None
             for _ in range(JEV_MAX_RETRIES):
@@ -1190,6 +1381,7 @@ def assemble_baselines(
             "model": JEV_MODEL,
             "state_chars": JEV_STATE_CHARS,
             "response_marker": RESPONSE_MARKER,
+            "questions_sha256": jev_questions_sha256(questions),
             "score_definition": "max(correction.noul, frustration.score / 4)",
         },
         "baselines": baselines_out,
@@ -1302,7 +1494,8 @@ def main(argv: list[str] | None = None) -> int:
     """Run C3 end-to-end: score gold, emit metrics + per-row scores.
 
     A warm jev cache makes the run offline; newly fetched API results are
-    persisted so the next run is deterministic (extension 7a).
+    persisted only after both artifacts pass the determinism gate, so a
+    rejected run leaves every tracked file untouched (review F8).
     """
     parser = argparse.ArgumentParser(description="C3 — Baselines (E2)")
     parser.add_argument("--gold", default=GOLD_PATH)
@@ -1327,11 +1520,16 @@ def main(argv: list[str] | None = None) -> int:
         excluded_ids=excluded_ids,
         unresolved_ids=unresolved_ids,
     )
-    save_jev_cache(cache, args.cache)
+    # Artifacts first, cache second: a run the determinism gate rejects must
+    # not have rewritten a tracked artifact already (review F8).
     paths = emit_artifacts(metrics, score_rows, args.metrics, args.scores)
+    save_jev_cache(
+        cache, args.cache, questions_sha256=metrics["jev"]["questions_sha256"]
+    )
     print(
         f"wrote {paths['metrics']} and {paths['scores']} "
-        f"(cache {len(cache)} entries, base rate {corpus_base_rate:.4f})"
+        f"(cache {jev_cache_entry_count(cache)} entries, "
+        f"base rate {corpus_base_rate:.4f})"
     )
     return 0
 

@@ -4,6 +4,7 @@ import importlib.util
 import inspect
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -20,6 +21,10 @@ _spec.loader.exec_module(baselines)
 
 from baselines import (
     FEATURE_NAMES,
+    JEV_CACHE_LEGACY_QUESTIONS_SHA256,
+    JEV_CACHE_QUESTIONS_KEY,
+    JEV_QUESTIONS,
+    JEV_QUESTIONS_SHA256,
     JEV_VARIANTS,
     RESPONSE_MARKER,
     alarm_rate,
@@ -36,20 +41,27 @@ from baselines import (
     fit_logistic,
     fnr,
     imperative_density,
+    jev_cache_entry_count,
+    jev_cache_key,
+    jev_cache_key_legacy,
+    jev_cache_questions_sha256,
+    jev_flag_score,
+    jev_legacy_adoption_allowed,
+    jev_questions_sha256,
     length_feature,
     lexical_features,
     load_corpus_base_rate,
     load_gold,
     load_gold_status_ids,
+    load_jev_cache,
     logistic_score,
+    main,
     operating_points,
     output_contract_absence,
     paired_auc_delta,
     parent_response_state,
     prompt_only_state,
-    jev_flag_score,
-    jev_cache_key,
-    load_jev_cache,
+    JevCacheError,
     own_response_state,
     query_jev,
     rescore_rows,
@@ -1096,3 +1108,344 @@ class TestSingleClassStratum:
                 "reference": None, "comparison": None, "difference": None,
             }, name
             assert block["auc_marginal"]["difference"] is None, name
+
+
+# ---------------------------------------------------------------------------
+# unit-005 — F2: the cache key must address the whole request payload (state,
+# model, questions), so a rubric change is a miss and not the old answers.
+# F8: an unreadable cache is cold or names the path, the save is atomic, and a
+# run rejected by the determinism gate leaves the tracked cache untouched.
+# ---------------------------------------------------------------------------
+
+# Two rubrics that differ in text only. States are identical across them, so a
+# cache that ignores the questions cannot tell the two apart — which is exactly
+# the substitution review F2 found. The marker is what the stub reads to answer
+# differently per payload, so a stale hit is visible in the scores.
+_RUBRIC_A = {
+    "marker": "a",
+    "frustration": {"type": "score", "instructions": "Rate the joy.", "criteria": ["low", "high"]},
+}
+_RUBRIC_B = {
+    "marker": "b",
+    "frustration": {"type": "score", "instructions": "Rate the rage.", "criteria": ["low", "high"]},
+}
+_RUBRIC_ANSWERS = {"default": 0.9, "a": 0.8, "b": 0.05}
+
+
+def _rubric_query(state, api_key=None, questions=None):
+    """jev answers that depend on the question payload, not the state alone.
+
+    Under rubric A the positives separate from the negatives; under B they do
+    not, so a run that reused A's answers would be visible in the AUC as well
+    as in the per-row dump.
+    """
+    marker = (questions or {}).get("marker", "default")
+    return {
+        "correction": {"noul": _RUBRIC_ANSWERS[marker] if "fix" in state else 0.1},
+        "frustration": {"score": 1.0},
+    }
+
+
+def _never_queried(state, api_key=None, questions=None):
+    raise AssertionError("the warm cache should have answered this request")
+
+
+def _legacy_cache_for(rows, answers):
+    """A cache file in the pre-F2 shape: keyed on (state, model), no digest."""
+    payload = json.dumps(answers, sort_keys=True)
+    return {
+        jev_cache_key_legacy(prompt_only_state(r["prompt"])): payload
+        for r in rows
+    }
+
+
+class TestJevCacheKeying:
+    def test_jev_cache_key_binds_the_questions_payload(self):
+        assert jev_cache_key("s") == jev_cache_key(
+            "s", questions_sha256=JEV_QUESTIONS_SHA256
+        )
+        assert jev_cache_key("s") != jev_cache_key(
+            "s", questions_sha256=jev_questions_sha256(_RUBRIC_B)
+        )
+        # the pre-F2 key is a different address, so a re-keyed file cannot be
+        # read by accident and the adoption path is the only bridge
+        assert jev_cache_key_legacy("s") != jev_cache_key("s")
+        assert jev_cache_key_legacy("s1") != jev_cache_key_legacy("s2")
+
+    def test_jev_questions_sha256_is_canonical_over_the_payload(self):
+        one = {"q": {"type": "score", "instructions": "x", "criteria": ["a", "b"]}}
+        other = {"q": {"criteria": ["a", "b"], "instructions": "x", "type": "score"}}
+        assert jev_questions_sha256(one) == jev_questions_sha256(other)
+        assert jev_questions_sha256(_RUBRIC_A) != jev_questions_sha256(_RUBRIC_B)
+        # criteria order is payload, not formatting
+        reordered = {"q": {"type": "score", "instructions": "x", "criteria": ["b", "a"]}}
+        assert jev_questions_sha256(reordered) != jev_questions_sha256(one)
+        assert jev_questions_sha256(None) == JEV_QUESTIONS_SHA256
+        # an absent payload falls back to the shipped rubric exactly as
+        # query_jev does, so the key always names what was actually sent
+        assert jev_questions_sha256({}) == JEV_QUESTIONS_SHA256
+
+    def test_legacy_cache_entries_are_adopted_and_not_refetched(self):
+        rows = _gold_rows()
+        answers = {"correction": {"noul": 0.4}, "frustration": {"score": 0.0}}
+        cache = _legacy_cache_for(rows, answers)
+        legacy_keys = set(cache)
+        recs = rescore_rows(
+            rows, "prompt_only", cache, "key", query_fn=_never_queried,
+            round_store="/nonexistent",
+        )
+        assert [r["score"] for r in recs] == [0.4, 0.4]
+        assert legacy_keys.isdisjoint(cache), "the legacy keys were left addressable"
+        for r, row in zip(recs, rows):
+            assert jev_cache_key(prompt_only_state(row["prompt"])) in cache
+
+    def test_legacy_cache_is_not_adopted_for_a_different_rubric(self):
+        # Review F2's counterexample, at the cache: an edited rubric must miss
+        # instead of publishing the answers the old rubric produced.
+        rows = _gold_rows()
+        stale = {"correction": {"noul": 0.9}, "frustration": {"score": 0.0}}
+        cache = _legacy_cache_for(rows, stale)
+        seen = []
+
+        def q(state, api_key=None, questions=None):
+            seen.append(questions)
+            return {"correction": {"noul": 0.1}, "frustration": {"score": 0.0}}
+
+        recs = rescore_rows(
+            rows, "prompt_only", cache, "key", query_fn=q,
+            round_store="/nonexistent", questions=_RUBRIC_B,
+        )
+        assert len(seen) == len(rows), "the stale rubric's answers were reused"
+        assert [r["score"] for r in recs] == [0.1, 0.1]
+        # the legacy entries stay put: they belong to another payload
+        assert set(cache) >= set(_legacy_cache_for(rows, stale))
+
+    def test_cache_adoption_is_gated_on_the_recorded_digest(self, tmp_path):
+        rows = _gold_rows()
+        answers = {"correction": {"noul": 0.6}, "frustration": {"score": 0.0}}
+        legacy = _legacy_cache_for(rows, answers)
+        for recorded, expected_calls in (
+            (jev_questions_sha256(_RUBRIC_A), 0),  # matches the payload in force
+            (JEV_QUESTIONS_SHA256, len(rows)),  # names a different rubric
+        ):
+            cache = save_jev_cache(
+                dict(legacy), tmp_path / f"cache-{recorded[:8]}.json",
+                questions_sha256=recorded,
+            )
+            loaded = load_jev_cache(cache)
+            assert jev_cache_questions_sha256(loaded) == recorded
+            calls = []
+
+            def q(state, api_key=None, questions=None):
+                calls.append(1)
+                return {"correction": {"noul": 0.2}, "frustration": {"score": 0.0}}
+
+            recs = rescore_rows(
+                rows, "prompt_only", loaded, "key", query_fn=q,
+                round_store="/nonexistent", questions=_RUBRIC_A,
+            )
+            assert len(calls) == expected_calls, recorded
+            assert [r["score"] for r in recs] == (
+                [0.6] * len(rows) if expected_calls == 0 else [0.2] * len(rows)
+            )
+
+    def test_cache_miss_without_api_key_fails_loudly(self):
+        # A miss is not a degraded run: no key means the answers cannot exist.
+        with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+            query_jev("state", "")
+        with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+            rescore_rows(
+                _gold_rows(), "prompt_only", {}, None, round_store="/nonexistent"
+            )
+
+    def test_rubric_change_does_not_reproduce_byte_identical_scores(self, tmp_path):
+        # The required regression test, end to end: the same states asked under
+        # a different payload must not come back byte-identical.
+        rows = _report_rows(4, 4)
+        store = _report_rounds(tmp_path, rows)
+        path = tmp_path / "jev-cache.json"
+
+        warm = {}
+        m_a, s_a = assemble_baselines(
+            rows, 0.2, warm, query_fn=_rubric_query, round_store=store,
+            questions=_RUBRIC_A,
+        )
+        save_jev_cache(warm, path, questions_sha256=jev_questions_sha256(_RUBRIC_A))
+
+        m_b, s_b = assemble_baselines(
+            rows, 0.2, load_jev_cache(path), query_fn=_rubric_query,
+            round_store=store, questions=_RUBRIC_B,
+        )
+        assert m_b["jev"]["questions_sha256"] == jev_questions_sha256(_RUBRIC_B)
+        assert m_a["jev"]["questions_sha256"] == jev_questions_sha256(_RUBRIC_A)
+        assert serialize_score_rows(s_a) != serialize_score_rows(s_b)
+        assert serialize_metrics(m_a) != serialize_metrics(m_b)
+
+        # ...while the same payload on the warm cache is still offline and
+        # byte-identical (decision 004's gate survives the re-keying).
+        m_a2, s_a2 = assemble_baselines(
+            rows, 0.2, load_jev_cache(path), query_fn=_never_queried,
+            round_store=store, questions=_RUBRIC_A,
+        )
+        assert serialize_metrics(m_a2) == serialize_metrics(m_a)
+        assert serialize_score_rows(s_a2) == serialize_score_rows(s_a)
+
+    def test_pinned_legacy_digest_is_what_authorizes_the_shipped_cache(self):
+        # The shipped cache records no digest, so the pin is its provenance: it
+        # must be the payload in force. A rubric edit moves JEV_QUESTIONS_SHA256
+        # and leaves the pin where it was, which is what makes the paid entries
+        # unreachable instead of quietly answering new questions. Re-pin only
+        # when re-stamping a pre-metadata cache file deliberately.
+        assert JEV_CACHE_LEGACY_QUESTIONS_SHA256 == JEV_QUESTIONS_SHA256, (
+            "the shipped pre-metadata cache was fetched under the pinned payload; "
+            "a rubric edit means its answers are unreachable and must be re-fetched "
+            "(or the file re-stamped by hand), not the pin quietly moved"
+        )
+
+    def test_metrics_record_the_questions_digest(self, tmp_path):
+        rows = _report_rows(2, 2)
+        store = _report_rounds(tmp_path, rows)
+        metrics, _ = assemble_baselines(
+            rows, 0.2, {}, query_fn=_rubric_query, round_store=store
+        )
+        assert metrics["jev"]["questions_sha256"] == jev_questions_sha256(
+            JEV_QUESTIONS
+        )
+
+
+class TestJevCacheCrashSafety:
+    @pytest.mark.parametrize("content", ["", "   ", "\n"])
+    def test_empty_cache_file_is_cold(self, tmp_path, content):
+        path = tmp_path / "jev-cache.json"
+        path.write_text(content)
+        assert load_jev_cache(path) == {}
+
+    def test_absent_cache_file_is_cold(self, tmp_path):
+        assert load_jev_cache(tmp_path / "nope.json") == {}
+
+    @pytest.mark.parametrize(
+        "content,match",
+        [
+            ("{ not json", "is not valid JSON"),
+            ("[]", "must hold a JSON object"),
+            (
+                '{"not-a-digest": "{\\"correction\\": {}}"}',
+                "not a cache digest",
+            ),
+            (
+                '{"' + "0" * 64 + '": {"correction": {}}}',
+                "not a JSON string",
+            ),
+            (
+                '{"' + "0" * 64 + '": "{ broken"}',
+                "not valid JSON",
+            ),
+            (
+                '{"' + JEV_CACHE_QUESTIONS_KEY + '": "nope"}',
+                "not a sha256 hex digest",
+            ),
+        ],
+    )
+    def test_corrupt_cache_raises_naming_the_path(self, tmp_path, content, match):
+        path = tmp_path / "jev-cache.json"
+        path.write_text(content)
+        with pytest.raises(JevCacheError, match=match):
+            load_jev_cache(path)
+        # and the message always names the file the operator has to fix
+        with pytest.raises(JevCacheError, match=str(path)):
+            load_jev_cache(path)
+
+    def test_save_jev_cache_is_deterministic_and_roundtrips(self, tmp_path):
+        rows = _gold_rows()
+        cache = {}
+        rescore_rows(
+            rows, "prompt_only", cache, "key", query_fn=_rubric_query,
+            round_store="/nonexistent",
+        )
+        first = save_jev_cache(cache, tmp_path / "a.json")
+        second = save_jev_cache(dict(reversed(list(cache.items()))), tmp_path / "b.json")
+        assert first.read_bytes() == second.read_bytes()
+        assert load_jev_cache(first) == cache
+        assert jev_cache_questions_sha256(load_jev_cache(first)) is None
+
+    def test_save_jev_cache_stamps_the_questions_digest(self, tmp_path):
+        cache = {"0" * 64: '{"correction": {"noul": 0.5}}'}
+        path = save_jev_cache(cache, tmp_path / "c.json", questions_sha256="f" * 64)
+        loaded = load_jev_cache(path)
+        assert jev_cache_questions_sha256(loaded) == "f" * 64
+        assert jev_cache_entry_count(loaded) == 1
+        assert dict(loaded) != cache  # the stamp is a member of the document
+        assert jev_legacy_adoption_allowed(cache, "f" * 64) is False
+
+    def test_failed_save_leaves_the_warm_cache_and_no_temp_file(
+        self, tmp_path, monkeypatch
+    ):
+        cache = {"0" * 64: '{"correction": {"noul": 0.5}}'}
+        path = save_jev_cache(cache, tmp_path / "jev-cache.json")
+        before = path.read_bytes()
+
+        def boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            save_jev_cache({"1" * 64: "{}"}, path)
+        assert path.read_bytes() == before
+        assert list(tmp_path.glob("*tmp*")) == []
+
+    def test_main_writes_no_cache_when_the_artifact_gate_rejects(
+        self, tmp_path, monkeypatch
+    ):
+        # F8: the cache was saved before the determinism gate, so a run that
+        # published nothing had already rewritten a tracked artifact.
+        store, cache_path, _cache = self._warm_run(tmp_path, monkeypatch)
+        metrics_path = tmp_path / "baseline-metrics.json"
+        metrics_path.write_text('{"drift": 1}\n', encoding="utf-8")
+        before = cache_path.read_bytes()
+        with pytest.raises(RuntimeError, match="non-deterministic output"):
+            main(
+                ["--gold", "unused", "--base-rate-results", "unused",
+                 "--cache", str(cache_path), "--metrics", str(metrics_path),
+                 "--scores", str(tmp_path / "scores.jsonl"),
+                 "--round-store", str(store), "--api-key", ""]
+            )
+        assert cache_path.read_bytes() == before
+        assert not (tmp_path / "scores.jsonl").exists()
+
+    def test_main_stamps_the_cache_after_a_successful_emit(
+        self, tmp_path, monkeypatch
+    ):
+        store, cache_path, cache = self._warm_run(tmp_path, monkeypatch)
+        assert jev_cache_questions_sha256(load_jev_cache(cache_path)) is None
+        main(
+            ["--gold", "unused", "--base-rate-results", "unused",
+             "--cache", str(cache_path),
+             "--metrics", str(tmp_path / "baseline-metrics.json"),
+             "--scores", str(tmp_path / "baseline-scores.jsonl"),
+             "--round-store", str(store), "--api-key", ""]
+        )
+        loaded = load_jev_cache(cache_path)
+        assert jev_cache_questions_sha256(loaded) == JEV_QUESTIONS_SHA256
+        assert jev_cache_entry_count(loaded) == jev_cache_entry_count(cache)
+
+    @staticmethod
+    def _warm_run(tmp_path, monkeypatch):
+        """A tiny gold set with every jev state already answered offline."""
+        rows = _report_rows(2, 2)
+        store = _report_rounds(tmp_path, rows)
+        answers = {"correction": {"noul": 0.7}, "frustration": {"score": 2.0}}
+        cache = {}
+        for row in rows:
+            data = json.loads((store / f"{row['id']}.json").read_text())
+            parent = json.loads((store / "sharedparent.json").read_text())
+            for state in (
+                prompt_only_state(row["prompt"]),
+                own_response_state(row["prompt"], data),
+                parent_response_state(row["prompt"], parent),
+            ):
+                cache[jev_cache_key(state)] = json.dumps(answers, sort_keys=True)
+        path = save_jev_cache(cache, tmp_path / "jev-cache.json")
+        monkeypatch.setattr(baselines, "load_gold", lambda p: (rows, {}))
+        monkeypatch.setattr(baselines, "load_gold_status_ids", lambda p: ([], []))
+        monkeypatch.setattr(baselines, "load_corpus_base_rate", lambda p=1: 0.25)
+        return store, path, cache
