@@ -220,6 +220,139 @@ def test_manifest_round_trips_byte_identical(tmp_path: Path) -> None:
     assert p1.read_bytes() == p2.read_bytes()
 
 
+# --- S2 adjudication (offline, cache-backed) ---------------------------------
+
+
+class _FakeS2:
+    """Minimal stand-in exposing the S2 surface the adapter drives.
+
+    It keeps the real adapter/resume/append logic under test without depending
+    on a sibling checkout or a network. ``llm_request`` records calls so a test
+    can prove the cache seam suppresses the second call.
+    """
+
+    def __init__(self, verdicts: dict[str, dict] | None = None) -> None:
+        self.verdicts = verdicts or {}
+        self.llm_calls = 0
+
+    def llm_request(self, system: str, user: str, api_key: str, model: str, max_retries: int = 3) -> str:
+        self.llm_calls += 1
+        # The user payload embeds the target round's prompt text.
+        rid = next((r for r in self.verdicts if r in user), None)
+        body = self.verdicts.get(rid, {"verdict": "no_fault_within_round"})
+        return json.dumps(body)
+
+    def process_round(self, rid, rounds_dir, api_key, args, stages):
+        assert stages == {"S2"}, f"adjudication must run S2 only, got {stages}"
+        body = self.verdicts.get(rid, {"verdict": "no_fault_within_round"})
+        # Embed the round id so ``llm_request`` can resolve the canned verdict.
+        text = self.llm_request("sys", f"TARGET ROUND:\n{rid}", api_key, args.llm_model)
+        return {"id": rid, "s2": json.loads(text), "bin": body.get("verdict")}
+
+
+def _adjudicate(rid, module, **kwargs):
+    return sbr.adjudicate_one(rid, s2_module=module, **kwargs)
+
+
+def test_adjudicate_one_runs_s2_only() -> None:
+    fake = _FakeS2()
+    rec = _adjudicate("a", fake)
+    assert rec["id"] == "a"
+    assert rec["s2"]["verdict"] == "no_fault_within_round"
+
+
+def test_adjudicate_one_carries_fault_type() -> None:
+    fake = _FakeS2({"b": {"verdict": "fault_observed", "fault_type": "prompt-misread"}})
+    rec = _adjudicate("b", fake)
+    assert rec["s2"]["fault_type"] == "prompt-misread"
+    # S0/S1 never run in this script.
+    assert "s0_f" not in rec and "s1_fault_type" not in rec
+
+
+def test_cache_seam_suppresses_second_llm_call() -> None:
+    fake = _FakeS2()
+    cache: dict[str, str] = {}
+    with sbr.cached_llm(fake, cache):
+        _adjudicate("a", fake)
+        first_calls = fake.llm_calls
+        _adjudicate("a", fake)  # identical request -> served from cache
+    assert fake.llm_calls == first_calls, "cached request must not re-call the LLM"
+    assert cache  # something was cached
+
+
+def test_cache_seam_restores_original_callable() -> None:
+    fake = _FakeS2()
+    with sbr.cached_llm(fake, {}):
+        # Inside the seam the attribute is the stand-in, not the class method.
+        assert getattr(fake.llm_request, "__self__", None) is None
+    # On exit the real bound method is restored.
+    assert fake.llm_request.__self__ is fake
+    assert fake.llm_request.__func__ is _FakeS2.llm_request
+
+
+def test_llm_cache_round_trips(tmp_path: Path) -> None:
+    cache = {"k1": "v1", "k2": "v2"}
+    p = sbr.save_llm_cache(cache, tmp_path / "cache.json")
+    assert sbr.load_llm_cache(p) == cache
+
+
+def test_load_llm_cache_absent_is_empty(tmp_path: Path) -> None:
+    assert sbr.load_llm_cache(tmp_path / "missing.json") == {}
+
+
+# --- resume-on-union + append guard ------------------------------------------
+
+
+def test_resume_plan_excludes_already_done_ids() -> None:
+    manifest = {"sampled_ids": ["a", "b", "c"]}
+    results = [{"id": "b"}]
+    assert sbr.resume_plan(manifest, results) == ["a", "c"]
+
+
+def test_resume_plan_keeps_manifest_order() -> None:
+    manifest = {"sampled_ids": ["c", "a", "b"]}
+    results = [{"id": "a"}]
+    assert sbr.resume_plan(manifest, results) == ["c", "b"]
+
+
+def test_resume_plan_ignores_results_outside_manifest() -> None:
+    """A result id not in the manifest is done, not a new todo."""
+    manifest = {"sampled_ids": ["a", "b"]}
+    results = [{"id": "z"}]
+    assert sbr.resume_plan(manifest, results) == ["a", "b"]
+
+
+def test_resume_plan_is_empty_when_all_done() -> None:
+    manifest = {"sampled_ids": ["a", "b"]}
+    assert sbr.resume_plan(manifest, [{"id": "a"}, {"id": "b"}]) == []
+
+
+def test_append_result_writes_once(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    assert sbr.append_result({"id": "a", "bin": "x"}, out) is True
+    assert sbr.load_results(out) == [{"id": "a", "bin": "x"}]
+
+
+def test_append_result_refuses_duplicate_id(tmp_path: Path) -> None:
+    out = tmp_path / "results.jsonl"
+    sbr.append_result({"id": "a", "bin": "x"}, out)
+    assert sbr.append_result({"id": "a", "bin": "y"}, out) is False
+    rows = sbr.load_results(out)
+    assert len(rows) == 1 and rows[0]["bin"] == "x"
+
+
+def test_append_guard_survives_reprocessed_todo(tmp_path: Path) -> None:
+    """Resume-on-union never writes a duplicate even if todo repeats."""
+    out = tmp_path / "results.jsonl"
+    manifest = {"sampled_ids": ["a", "b"]}
+    for rid in sbr.resume_plan(manifest, sbr.load_results(out)):
+        sbr.append_result({"id": rid}, out)
+    # A restart re-derives the same todo; every append must be refused.
+    for rid in sbr.resume_plan(manifest, sbr.load_results(out)):
+        assert sbr.append_result({"id": rid}, out) is False
+    ids = [r["id"] for r in sbr.load_results(out)]
+    assert ids == ["a", "b"]
+
 
 # --- live anchors (skipped when artifacts are unreachable) --------------------
 

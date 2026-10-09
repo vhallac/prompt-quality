@@ -28,12 +28,14 @@ means frame arithmetic never has to reach into the sibling ``semblr`` checkout.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import importlib.util
 import json
 import os
 import random
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 # --- Constants ---------------------------------------------------------------
 
@@ -100,6 +102,33 @@ EXPECTED_FRAME = 5159
 # Default sample size (issue #2: "sample ~100 random unscanned rounds").
 DEFAULT_SAMPLE_SIZE = 100
 DEFAULT_SEED = 20261009
+
+# The S2 root-cause machinery lives in the sibling semblr checkout. It is
+# imported (not shelled out to) so the LLM call has an in-process seam: a test
+# swaps ``llm_request`` for a cache-backed function and runs the real S2 prompt
+# assembly, chain walk, and response parsing offline.
+DEFAULT_FAULT_PIPELINE = Path(
+    os.environ.get(
+        "PROMPT_QUALITY_FAULT_PIPELINE",
+        PROJECT_ROOT.parent / "semblr" / "scripts" / "fault-pipeline.py",
+    )
+)
+
+# Default adjudication transcript (one record per adjudicated round).
+DEFAULT_RESULTS = Path(
+    os.environ.get(
+        "PROMPT_QUALITY_RESULTS",
+        PROJECT_ROOT / "dataset" / "base-rate-results.jsonl",
+    )
+)
+
+DEFAULT_STATE_CHARS = 12000
+DEFAULT_CHAIN_CHARS = 24000
+DEFAULT_LLM_MODEL = "z-ai/glm-5.3-flash"
+
+# S2 is the only stage this script runs (issue #2: no S0/S1 ranking).
+S2_STAGES = frozenset({"S2"})
+
 
 # --- I/O helpers -------------------------------------------------------------
 
@@ -244,6 +273,178 @@ def assert_anchors(manifest: dict) -> None:
         raise SystemExit(
             f"frame drift: expected {EXPECTED_FRAME}, got {manifest['frame_size']}"
         )
+
+
+# --- S2 adjudication reuse ---------------------------------------------------
+
+
+def load_s2_module(path: str | Path = DEFAULT_FAULT_PIPELINE):
+    """Import ``fault-pipeline.py`` and return the module.
+
+    Loading by path (rather than package import) keeps the sibling script's
+    hyphenated filename usable and pins exactly which copy is driven. The
+    module object is also the monkeypatch target for the LLM cache seam.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"S2 machinery not found: {path}")
+    spec = importlib.util.spec_from_file_location("fault_pipeline", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load module spec from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fault_pipeline"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class S2Args:
+    """The argument surface ``process_round``/``s2_root_cause`` read.
+
+    Mirrors the subset of the fault-pipeline argparse namespace the S2 path
+    touches, so the imported machinery runs unmodified.
+    """
+
+    def __init__(
+        self,
+        state_chars: int = DEFAULT_STATE_CHARS,
+        chain_chars: int = DEFAULT_CHAIN_CHARS,
+        llm_model: str = DEFAULT_LLM_MODEL,
+    ) -> None:
+        self.state_chars = state_chars
+        self.chain_chars = chain_chars
+        self.llm_model = llm_model
+
+
+def cache_key(system: str, user: str, model: str) -> str:
+    """Stable cache key for one LLM request."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for part in (system, user, model):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def load_llm_cache(path: str | Path) -> dict[str, str]:
+    """Load a ``{cache_key: response_text}`` JSON cache (empty if absent)."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_llm_cache(cache: dict[str, str], path: str | Path) -> Path:
+    """Persist the cache deterministically."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(cache, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@contextlib.contextmanager
+def cached_llm(s2_module, cache: dict[str, str]):
+    """Swap ``s2_module.llm_request`` for a cache-backed stand-in.
+
+    On a cache hit the stored response is returned without a network call; on a
+    miss the real ``llm_request`` runs and its text is stored under the key.
+    Restores the original callable on exit, so the seam never leaks.
+    """
+    original = s2_module.llm_request
+
+    def wrapped(system: str, user: str, api_key: str, model: str, max_retries: int = 3) -> str:
+        key = cache_key(system, user, model)
+        if key in cache:
+            return cache[key]
+        text = original(system, user, api_key, model, max_retries=max_retries)
+        cache[key] = text
+        return text
+
+    s2_module.llm_request = wrapped
+    try:
+        yield cache
+    finally:
+        s2_module.llm_request = original
+
+
+def adjudicate_one(
+    rid: str,
+    rounds_dir: str | Path = DEFAULT_ROUND_STORE,
+    s2_module=None,
+    args: S2Args | None = None,
+    api_key: str | None = None,
+) -> dict:
+    """Adjudicate one round with S2 only and return its result record.
+
+    Delegates to the imported ``process_round`` with ``stages={'S2'}``: no
+    S0/S1 ranking, no S3/S4 re-route. The record carries the round id, the
+    S2 verdict/fault_type/root_cause, and the derived ``bin``.
+    """
+    if s2_module is None:
+        s2_module = load_s2_module()
+    if args is None:
+        args = S2Args()
+    return s2_module.process_round(rid, Path(rounds_dir), api_key, args, set(S2_STAGES))
+
+
+# --- Results transcript + resume-on-union ------------------------------------
+
+
+def load_results(path: str | Path = DEFAULT_RESULTS) -> list[dict]:
+    """Read the results transcript, skipping blank/unparseable lines."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def resume_plan(manifest: dict, results: Iterable[dict]) -> list[str]:
+    """Ids still to adjudicate: manifest ids minus ids already in results.
+
+    Keyed on the **union** of manifest ids and existing result ids (issue #2 /
+    C1 finding): the transcript is the source of truth for *done*, and the
+    manifest is the source of truth for *wanted*. An id present in either set
+    is never double-written and never re-adjudicated; order follows the
+    manifest draw so a resumed run is deterministic.
+    """
+    done = {row["id"] for row in results if row.get("id")}
+    seen: set[str] = set(done)
+    todo = []
+    for rid in manifest.get("sampled_ids", []):
+        if rid in seen:
+            continue
+        seen.add(rid)
+        todo.append(rid)
+    return todo
+
+
+def append_result(record: dict, path: str | Path = DEFAULT_RESULTS) -> bool:
+    """Append one result row, refusing to duplicate an existing id.
+
+    Returns True when the row was written, False when the id is already in the
+    transcript. The guard is what makes resume-on-union safe: even if a caller
+    mis-orders the todo list, an id can never be written twice.
+    """
+    path = Path(path)
+    existing = {row["id"] for row in load_results(path) if row.get("id")}
+    if record.get("id") in existing:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return True
+
 
 # --- CLI ---------------------------------------------------------------------
 
