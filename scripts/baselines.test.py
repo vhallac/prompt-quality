@@ -124,6 +124,17 @@ class TestMetricsOperatingPoints:
         # alarm rates: t=0.1 → 1.0, t=0.15 → 0.5, t=0.25 → 0.0
         assert base_rate_threshold(scores, labels, 0.5) == pytest.approx(0.15)
 
+    def test_base_rate_threshold_can_alarm_nothing(self):
+        # Constant score vector: the only candidate that alarms any row alarms
+        # every row (rate 1.0). With a small target the nearest alarm rate is
+        # 0.0, reachable only by the above-max threshold. Regression for the
+        # floor baseline's corpus-base-rate operating point.
+        scores = [0.1239] * 10
+        labels = [1, 0] * 5
+        t = base_rate_threshold(scores, labels, 0.1939)
+        assert t > max(scores)
+        assert sum(1 for s in scores if s >= t) == 0
+
     def test_operating_points_names_both(self):
         scores = [0.1, 0.2, 0.8, 0.9]
         labels = [0, 0, 1, 1]

@@ -66,11 +66,13 @@ def specificity(scores: Sequence[float], labels: Sequence[int], threshold: float
 
 def _candidate_thresholds(scores: Sequence[float]) -> list[float]:
     """Deterministic candidates: midpoints between sorted unique scores,
-    plus an extreme low endpoint that alarms everything."""
+    plus an extreme low endpoint that alarms everything and an extreme high
+    endpoint that alarms nothing."""
     uniq = sorted(set(scores))
     cands = [uniq[0]]  # alarm everything (all scores >= uniq[0])
     for lo, hi in zip(uniq, uniq[1:]):
         cands.append((lo + hi) / 2.0)
+    cands.append(math.nextafter(uniq[-1], math.inf))  # alarm nothing
     return cands
 
 

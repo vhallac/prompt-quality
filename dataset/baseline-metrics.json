@@ -14,11 +14,11 @@
       "fnr": {
         "corpus_base_rate": {
           "ci95": [
-            0.0,
-            0.0
+            1.0,
+            1.0
           ],
-          "point": 0.0,
-          "threshold": 0.12393162393162394
+          "point": 1.0,
+          "threshold": 0.12393162393162395
         },
         "youden_j": {
           "ci95": [
@@ -580,7 +580,7 @@
     },
     "thresholds_used": {
       "base_rate": {
-        "corpus_base_rate": 0.12393162393162394,
+        "corpus_base_rate": 0.12393162393162395,
         "youden_j": 0.12393162393162394
       },
       "jev_own_response": {
