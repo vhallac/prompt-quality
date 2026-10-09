@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local-only task plan workspace (also in .git/info/exclude)
+.todo
+.todo*.tar.gz
+
+# Local scratch
+.tmp/
