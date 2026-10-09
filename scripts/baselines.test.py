@@ -298,12 +298,24 @@ class TestLogisticCombiner:
         assert auc(s, y) == 1.0
 
     def test_standardisation_zero_std_feature(self):
-        # a constant feature must not blow up: std 0 -> 0
+        # a constant feature must not blow up: std 0 -> published as 0, and its
+        # standardised value is 0 so it cannot contribute to any logit
         rows = ([{"label": "positive", "prompt": "fix it"}] * 3
                 + [{"label": "negative", "prompt": "fine day"}] * 3)
-        scores, weights = combined_lexical_scores(rows)
-        assert len(scores) == 6 and len(weights) == 5
+        scores, combiner = combined_lexical_scores(rows)
+        assert len(scores) == 6
+        assert set(combiner) == {"intercept", "features"}
+        assert set(combiner["features"]) == set(FEATURE_NAMES)
+        assert math.isfinite(combiner["intercept"])
         assert all(math.isfinite(s) for s in scores)
+        raw = [{n: lexical_features(r["prompt"])[n] for n in FEATURE_NAMES} for r in rows]
+        for name in FEATURE_NAMES:
+            values = {row[name] for row in raw}
+            spec = combiner["features"][name]
+            assert math.isfinite(spec["weight"])
+            if len(values) == 1:
+                assert spec["std"] == 0.0
+                assert spec["mean"] == pytest.approx(next(iter(values)))
 
 
 class TestGoldBaselineEndToEnd:
@@ -586,7 +598,8 @@ class TestReporting:
         assert set(metrics["deltas"]) == {"leak", "session"}
         assert metrics["feature_definitions"]["imperative_density"]["imperative_verbs"]
         assert metrics["feature_definitions"]["deixis"]["markers"]
-        assert metrics["lexical_weights"].keys() == set(FEATURE_NAMES)
+        assert set(metrics["lexical_weights"]) == {"intercept", "features"}
+        assert set(metrics["lexical_weights"]["features"]) == set(FEATURE_NAMES)
         assert set(metrics["run_report"]["thresholds_used"]) == expected
         # per-row dump carries every score C4/C5/C6 reuse
         assert len(score_rows) == 12
@@ -598,6 +611,55 @@ class TestReporting:
             "jev_own_response",
             "jev_parent_response",
         } <= set(score_rows[0])
+
+    def test_published_combiner_is_rederivable(self, tmp_path):
+        """F1: the published combiner must be re-derivable, not just named.
+
+        Rebuilds every row's logit from the artifact's own published fields
+        (intercept, per-feature weight/mean/std) and the raw features in the
+        per-row dump, and requires it to equal the published lexical_combined.
+        A weight map keyed by feature name cannot carry the intercept, so the
+        fit that produced these scores was not the one published: the bias was
+        published as `length`'s weight and every other weight shifted one slot.
+        The second half of the test pins that failure mode — the shifted
+        assignment must reproduce no row.
+        """
+        rows = _report_rows()
+        store = _report_rounds(tmp_path, rows)
+        metrics, score_rows = assemble_baselines(
+            rows, 0.2, {}, query_fn=_report_query, round_store=store
+        )
+        combiner = metrics["lexical_weights"]
+        published = [combiner["features"][n]["weight"] for n in FEATURE_NAMES]
+        assert len(published) == len(FEATURE_NAMES)
+        assert len(set(published)) > 1, "degenerate fixture: weights all equal"
+
+        def rebuild(weights_in_feature_order, rec):
+            z = combiner["intercept"]
+            for name, weight in zip(FEATURE_NAMES, weights_in_feature_order):
+                spec = combiner["features"][name]
+                x = rec[f"feat_{name}"]
+                scaled = 0.0 if spec["std"] == 0 else (x - spec["mean"]) / spec["std"]
+                z += weight * scaled
+            return z
+
+        # the defect F1 reported: bias in slot 0, every weight shifted one
+        # feature to the right, the last weight dropped
+        shifted = [combiner["intercept"], *published[:-1]]
+
+        shifted_mismatches = 0
+        for rec in score_rows:
+            assert rebuild(published, rec) == pytest.approx(
+                rec["lexical_combined"], abs=1e-9
+            ), rec["id"]
+            if rebuild(shifted, rec) != pytest.approx(
+                rec["lexical_combined"], abs=1e-9
+            ):
+                shifted_mismatches += 1
+        assert shifted_mismatches == len(score_rows), (
+            "the off-by-one weight assignment reproduced some rows: the fixture "
+            "cannot distinguish the published mapping from the shifted one"
+        )
 
     def test_report_emits_per_feature_aucs(self, tmp_path):
         # issue #3 main success scenario step 3: baseline (b) reports each

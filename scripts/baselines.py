@@ -651,10 +651,18 @@ def rescore_rows(
     return out
 
 
-def combined_lexical_scores(rows: list[dict]) -> tuple[list[float], list[float]]:
+def combined_lexical_scores(rows: list[dict]) -> tuple[list[float], dict]:
     """Fit the logistic combiner on the gold rows' standardised features and
-    return (scores, weights). Standardisation uses the corpus mean/std
-    (std 0 features stay at 0)."""
+    return (scores, combiner).
+
+    Standardisation uses the corpus mean/std (std 0 features stay at 0).
+
+    ``combiner`` is the published combiner, not a bare weight list: the bias is
+    named as ``intercept``, and each of ``FEATURE_NAMES`` carries its own weight
+    together with the mean/std used to standardise it. That is everything a
+    reader needs to re-derive every ``lexical_combined`` score from the artifact
+    alone (review F1); a feature-keyed weight map cannot express the intercept
+    and silently shifts one weight onto every feature."""
     feats = [lexical_features(r["prompt"]) for r in rows]
     X_raw = [[f[name] for name in FEATURE_NAMES] for f in feats]
     d = len(FEATURE_NAMES)
@@ -669,7 +677,22 @@ def combined_lexical_scores(rows: list[dict]) -> tuple[list[float], list[float]]
     ]
     y = [1 if r["label"] == "positive" else 0 for r in rows]
     weights = fit_logistic(X, y)
-    return [logistic_score(weights, x) for x in X], weights
+    assert len(weights) == len(FEATURE_NAMES) + 1, (
+        f"logistic fit returned {len(weights)} values for "
+        f"{len(FEATURE_NAMES)} features + intercept"
+    )
+    combiner = {
+        "intercept": weights[0],
+        "features": {
+            name: {
+                "weight": weights[i + 1],
+                "mean": means[i],
+                "std": stds[i],
+            }
+            for i, name in enumerate(FEATURE_NAMES)
+        },
+    }
+    return [logistic_score(weights, x) for x in X], combiner
 
 
 # ---------------------------------------------------------------------------
@@ -974,7 +997,7 @@ def assemble_baselines(
     offline and deterministic (extension 7a).
     """
     labels = _labels_of(rows)
-    lexical_scores, weights = combined_lexical_scores(rows)
+    lexical_scores, combiner = combined_lexical_scores(rows)
     base_scores = constant_prevalence_scores(rows)
     jev = {
         v: rescore_rows(
@@ -1036,7 +1059,7 @@ def assemble_baselines(
         },
         "feature_definitions": _feature_definitions(),
         "feature_aucs": per_feature_aucs(rows, n_boot, seed),
-        "lexical_weights": dict(zip(FEATURE_NAMES, weights)),
+        "lexical_weights": combiner,
         "jev": {
             "model": JEV_MODEL,
             "state_chars": JEV_STATE_CHARS,
