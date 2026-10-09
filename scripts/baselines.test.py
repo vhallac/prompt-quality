@@ -4,6 +4,7 @@ import importlib.util
 import inspect
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -910,3 +911,188 @@ class TestReportDeterminism:
         drifted[0]["lexical_combined"] = drifted[0]["lexical_combined"] + 0.5
         with pytest.raises(RuntimeError, match=drifted[0]["id"]):
             emit_artifacts(m, drifted, mp, sp)
+
+
+# ---------------------------------------------------------------------------
+# unit-004 — F5: the delta block must name its own paired population, and F7:
+# the ext 5a single-class path and the zero-pairs path must be asserted.
+# ---------------------------------------------------------------------------
+
+# Per-row scores that overlap between classes: a constant-per-class fixture
+# gives every arm AUC 1.0 in every subpopulation, so it cannot tell a paired
+# difference from a marginal one. With these tables prompt_only AUC is 0.4375
+# and own_response AUC is 0.6875 over the full eight rows, and both move when a
+# row leaves the paired population.
+_PROMPT_ONLY_BY_ROW = {
+    "p00": 0.55, "p01": 0.45, "p02": 0.65, "p03": 0.25,
+    "n00": 0.35, "n01": 0.75, "n02": 0.15, "n03": 0.85,
+}
+_OWN_RESPONSE_BY_ROW = {
+    "p00": 0.90, "p01": 0.35, "p02": 0.80, "p03": 0.20,
+    "n00": 0.60, "n01": 0.10, "n02": 0.50, "n03": 0.30,
+}
+
+
+def _row_varying_query(state, api_key=None, questions=None):
+    """Stand-in jev scorer keyed on the row id, so an arm's AUC depends on
+    which rows are present (issue #3 extensions 4a/4b drop rows per arm)."""
+    rid = re.search(r"[pn]\d\d", state).group(0)
+    table = _OWN_RESPONSE_BY_ROW if "response for" in state else _PROMPT_ONLY_BY_ROW
+    return {"correction": {"noul": table[rid]}, "frustration": {"score": 0.0}}
+
+
+def _pair_record(rid, score, label):
+    return {"id": rid, "score": score, "label": label, "reason": None}
+
+
+class TestPairedDeltaProvenance:
+    def test_paired_delta_block_names_its_own_population(self):
+        left = [
+            _pair_record("p00", 0.90, "positive"),
+            _pair_record("n00", 0.10, "negative"),
+        ]
+        right = [
+            _pair_record("p00", 0.20, "positive"),
+            _pair_record("n00", 0.80, "negative"),
+        ]
+        block = paired_auc_delta(left, right, n_boot=200, seed=7)
+        assert block["n_pairs"] == 2
+        assert block["n_reference_rows"] == 2
+        assert "n_pairs = 2" in block["population"]
+        assert block["auc_reference_paired"]["reference"] == auc([0.90, 0.10], [1, 0])
+        assert block["auc_reference_paired"]["comparison"] == auc([0.20, 0.80], [1, 0])
+        # the paired columns are what the published point is made of
+        assert block["auc_reference_paired"]["difference"] == block["point"]
+
+    @pytest.mark.parametrize(
+        "reason, left, right",
+        [
+            (
+                "no id in common",
+                [_pair_record("p00", 0.9, "positive"), _pair_record("n00", 0.1, "negative")],
+                [_pair_record("q00", 0.5, "positive"), _pair_record("q01", 0.5, "negative")],
+            ),
+            (
+                "null score in the comparison arm",
+                [_pair_record("p00", 0.9, "positive"), _pair_record("n00", 0.1, "negative")],
+                [_pair_record("p00", None, "positive"), _pair_record("n00", None, "negative")],
+            ),
+            (
+                "null score in the reference arm",
+                [_pair_record("p00", None, "positive"), _pair_record("n00", None, "negative")],
+                [_pair_record("p00", 0.7, "positive"), _pair_record("n00", 0.4, "negative")],
+            ),
+            (
+                "no rows at all",
+                [],
+                [],
+            ),
+        ],
+    )
+    def test_paired_delta_without_shared_valid_rows_is_null_but_keeps_its_shape(
+        self, reason, left, right
+    ):
+        block = paired_auc_delta(left, right, n_boot=200, seed=7)
+        populated = paired_auc_delta(
+            [_pair_record("p00", 0.9, "positive"), _pair_record("n00", 0.1, "negative")],
+            [_pair_record("p00", 0.2, "positive"), _pair_record("n00", 0.8, "negative")],
+            n_boot=200,
+            seed=7,
+        )
+        assert reason  # every unpairable flavour returns the same block shape
+        assert set(block) == set(populated), block
+        assert block["point"] is None
+        assert block["ci95"] is None
+        assert block["n_pairs"] == 0
+        assert block["auc_reference_paired"] == {
+            "reference": None, "comparison": None, "difference": None,
+        }
+        assert "n_pairs = 0" in block["population"]
+
+    def test_paired_delta_equals_marginal_difference_when_arms_share_every_row(self, tmp_path):
+        rows = _report_rows(4, 4)
+        store = _report_rounds(tmp_path, rows)
+        metrics, _ = assemble_baselines(
+            rows, 0.2, {}, query_fn=_row_varying_query, round_store=store
+        )
+        block = metrics["deltas"]["leak"]
+        baselines = metrics["baselines"]
+        assert block["arms"] == {"reference": "jev_prompt_only", "comparison": "jev_own_response"}
+        assert block["n_pairs"] == block["n_reference_rows"] == 8
+        assert block["auc_reference_paired"]["reference"] == baselines["jev_prompt_only"]["auc"]["point"]
+        assert block["auc_reference_paired"]["comparison"] == baselines["jev_own_response"]["auc"]["point"]
+        assert block["auc_marginal"]["difference"] == block["point"]
+        # anchored arithmetic: 11/16 - 7/16
+        assert block["point"] == pytest.approx(0.25)
+
+    def test_paired_delta_discloses_the_population_it_differs_on(self, tmp_path):
+        # F5: subtracting the two headline AUCs is not the paired delta once an
+        # arm loses a row; the block has to show both numbers and why.
+        rows = _report_rows(4, 4)
+        store = _report_rounds(tmp_path, rows)
+        (store / "p00.json").unlink()
+        metrics, _ = assemble_baselines(
+            rows, 0.2, {}, query_fn=_row_varying_query, round_store=store
+        )
+        block = metrics["deltas"]["leak"]
+        assert block["n_pairs"] == 7
+        assert block["n_reference_rows"] == 8
+        assert "n_pairs = 7" in block["population"] and "8 reference-arm rows" in block["population"]
+        assert block["auc_marginal"]["reference"] == metrics["baselines"]["jev_prompt_only"]["auc"]["point"]
+        assert block["auc_marginal"]["comparison"] == metrics["baselines"]["jev_own_response"]["auc"]["point"]
+        assert block["point"] == pytest.approx(block["auc_reference_paired"]["difference"])
+        # the paired reference population is not the reference arm's own denominator
+        assert block["auc_reference_paired"]["reference"] == pytest.approx(5 / 12)
+        assert block["auc_reference_paired"]["reference"] != block["auc_marginal"]["reference"]
+        assert block["point"] != pytest.approx(block["auc_marginal"]["difference"])
+        assert block["point"] == pytest.approx(2 / 12)
+
+        # and the session delta keeps its own (identical-score) arms honest: its
+        # point is 0 while the marginal difference is not
+        session = metrics["deltas"]["session"]
+        assert session["point"] == 0.0
+        assert session["auc_marginal"]["difference"] != 0.0
+        assert session["auc_reference_paired"]["difference"] == session["point"]
+
+
+class TestSingleClassStratum:
+    @pytest.mark.parametrize(
+        "scores, labels",
+        [
+            ([0.2, 0.5, 0.9], [1, 1, 1]),
+            ([0.2, 0.5, 0.9], [0, 0, 0]),
+            ([], []),
+        ],
+    )
+    def test_single_class_stratum_yields_null_auc_and_null_fnrs_with_note(
+        self, scores, labels
+    ):
+        out = baseline_metrics(scores, labels, 0.19)
+        assert out["auc"] is None
+        assert out["fnr"] is None
+        assert "single-class stratum" in out["note"]
+        assert "extension 5a" in out["note"]
+        assert out["n"] == len(scores)
+        assert out["positives"] == sum(labels)
+        assert out["negatives"] == len(labels) - sum(labels)
+
+    def test_single_class_stratum_is_absent_from_thresholds_used(self, tmp_path):
+        # extension 5a at the reporting surface: a stratum with one class has no
+        # operating points, so run_report must not claim any.
+        rows = _report_rows(4, 0)
+        store = _report_rounds(tmp_path, rows)
+        metrics, _ = assemble_baselines(
+            rows, 0.2, {}, query_fn=_row_varying_query, round_store=store
+        )
+        assert metrics["run_report"]["thresholds_used"] == {}
+        for name, entry in metrics["baselines"].items():
+            assert entry["auc"] is None, name
+            assert entry["fnr"] is None, name
+            assert "extension 5a" in entry["note"], name
+        for name, block in metrics["deltas"].items():
+            assert block["n_pairs"] == 4, name
+            assert block["point"] is None, name
+            assert block["auc_reference_paired"] == {
+                "reference": None, "comparison": None, "difference": None,
+            }, name
+            assert block["auc_marginal"]["difference"] is None, name

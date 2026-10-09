@@ -914,6 +914,16 @@ def paired_auc_delta(
     Unpairable rows (a null score or a missing round file, extensions 4a/4b)
     are excluded from the delta only and listed by the caller's run report;
     the absolute baselines keep their own denominators.
+
+    The block therefore names the population it was computed on. ``n_pairs``
+    counts the rows valid in both arms, ``population`` says what that means and
+    why it matters, and ``auc_reference_paired`` gives both arms' AUCs *on that
+    subpopulation*, whose difference is exactly ``point``. The caller adds
+    ``arms`` (the ``baselines`` entries the two arms are) and ``auc_marginal``
+    (their published points). Subtracting the marginal AUCs is then visibly a
+    different quantity from the paired delta whenever the populations differ.
+    No delta value changes: ``point`` and ``ci95`` are the same arithmetic on
+    the same rows in the same bootstrap order.
     """
     b_by_id = {r["id"]: r for r in records_b}
     left: list[float] = []
@@ -934,31 +944,52 @@ def paired_auc_delta(
             return None
         return c - a
 
-    if not left:
-        return {"point": None, "ci95": None, "n_pairs": 0, "seed": seed}
-    rng = random.Random(seed)
     n = len(left)
-    values: list[float] = []
-    for _ in range(n_boot):
-        idx = [rng.randrange(n) for _ in range(n)]
-        v = delta(
-            [left[i] for i in idx],
-            [right[i] for i in idx],
-            [labels[i] for i in idx],
-        )
-        if v is not None:
-            values.append(v)
-    ci95 = None
-    if len(values) >= n_boot // 2:
-        values.sort()
-        ci95 = [
-            values[int(0.025 * len(values))],
-            values[min(len(values) - 1, int(0.975 * len(values)))],
-        ]
+    ci95: list[float] | None = None
+    if n:
+        rng = random.Random(seed)
+        values: list[float] = []
+        for _ in range(n_boot):
+            idx = [rng.randrange(n) for _ in range(n)]
+            v = delta(
+                [left[i] for i in idx],
+                [right[i] for i in idx],
+                [labels[i] for i in idx],
+            )
+            if v is not None:
+                values.append(v)
+        if len(values) >= n_boot // 2:
+            values.sort()
+            ci95 = [
+                values[int(0.025 * len(values))],
+                values[min(len(values) - 1, int(0.975 * len(values)))],
+            ]
+    paired_reference = auc(left, labels)
+    paired_comparison = auc(right, labels)
+    paired_difference = (
+        None
+        if paired_reference is None or paired_comparison is None
+        else paired_comparison - paired_reference
+    )
     return {
         "point": delta(left, right, labels),
         "ci95": ci95,
         "n_pairs": n,
+        "n_reference_rows": len(records_a),
+        "population": (
+            f"n_pairs = {n}: {n} of the {len(records_a)} reference-arm rows "
+            "score non-null in both arms. Rows unpairable on either side "
+            "(extensions 4a/4b) are excluded from this delta only, so the point "
+            "is a paired difference on that subpopulation and need not equal the "
+            "difference of the two marginal AUCs published under `baselines`; "
+            "auc_reference_paired holds both arms' AUCs computed on these paired "
+            "rows, and its difference is the point."
+        ),
+        "auc_reference_paired": {
+            "reference": paired_reference,
+            "comparison": paired_comparison,
+            "difference": paired_difference,
+        },
         "seed": seed,
         "n_boot": n_boot,
     }
@@ -1091,10 +1122,32 @@ def assemble_baselines(
         )
 
     prompt_only = jev["prompt_only"]
-    deltas = {
-        "leak": paired_auc_delta(prompt_only, jev["own_response"], n_boot, seed),
-        "session": paired_auc_delta(prompt_only, jev["parent_response"], n_boot, seed),
+    delta_arms = {
+        "leak": ("prompt_only", "own_response"),
+        "session": ("prompt_only", "parent_response"),
     }
+    deltas = {
+        name: paired_auc_delta(jev[ref], jev[other], n_boot, seed)
+        for name, (ref, other) in delta_arms.items()
+    }
+    for name, (ref, other) in delta_arms.items():
+        # The delta's own population is a subpopulation of the two headline
+        # AUCs, so the block states both: auc_reference_paired (emitted by
+        # paired_auc_delta) and the marginal points the reader would subtract.
+        ref_auc = baselines_out[f"jev_{ref}"]["auc"]
+        other_auc = baselines_out[f"jev_{other}"]["auc"]
+        reference_point = ref_auc["point"] if ref_auc else None
+        comparison_point = other_auc["point"] if other_auc else None
+        deltas[name]["arms"] = {"reference": f"jev_{ref}", "comparison": f"jev_{other}"}
+        deltas[name]["auc_marginal"] = {
+            "reference": reference_point,
+            "comparison": comparison_point,
+            "difference": (
+                None
+                if reference_point is None or comparison_point is None
+                else comparison_point - reference_point
+            ),
+        }
 
     null_scores = {v: jev_vectors[v][2] for v in JEV_VARIANTS}
     delta_exclusions = {
