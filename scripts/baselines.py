@@ -902,6 +902,25 @@ def _feature_definitions() -> dict:
     }
 
 
+def per_feature_aucs(
+    rows: list[dict],
+    n_boot: int = BOOTSTRAP_N,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict:
+    """AUC with seeded bootstrap CI for each lexical feature, on its own.
+
+    Issue #3 main success scenario step 3: baseline (b) reports each
+    feature's AUC alongside the combined score. Same scored gold rows and
+    same seed as every other AUC, so the intervals are comparable.
+    """
+    labels = _labels_of(rows)
+    feats = [lexical_features(r["prompt"]) for r in rows]
+    return {
+        name: bootstrap_ci([f[name] for f in feats], labels, auc, n_boot, seed)
+        for name in FEATURE_NAMES
+    }
+
+
 def _score_rows(
     rows: list[dict],
     lexical_scores: list[float],
@@ -1014,6 +1033,7 @@ def assemble_baselines(
             "negatives": labels.count(0),
         },
         "feature_definitions": _feature_definitions(),
+        "feature_aucs": per_feature_aucs(rows, n_boot, seed),
         "lexical_weights": dict(zip(FEATURE_NAMES, weights)),
         "jev": {
             "model": JEV_MODEL,

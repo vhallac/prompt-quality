@@ -588,6 +588,23 @@ class TestReporting:
             "jev_parent_response",
         } <= set(score_rows[0])
 
+    def test_report_emits_per_feature_aucs(self, tmp_path):
+        # issue #3 main success scenario step 3: baseline (b) reports each
+        # feature's AUC, not only the combined score.
+        rows = _report_rows()
+        store = _report_rounds(tmp_path, rows)
+        metrics, _ = assemble_baselines(
+            rows, 0.2, {}, query_fn=_report_query, round_store=store
+        )
+        feature_aucs = metrics["feature_aucs"]
+        assert set(feature_aucs) == set(FEATURE_NAMES)
+        labels = [1 if r["label"] == "positive" else 0 for r in rows]
+        for name in FEATURE_NAMES:
+            scores = [lexical_features(r["prompt"])[name] for r in rows]
+            assert feature_aucs[name]["point"] == auc(scores, labels)
+            assert len(feature_aucs[name]["ci95"]) == 2
+            assert feature_aucs[name]["seed"] == metrics["seed"]
+
     def test_report_lists_excluded_unresolved_and_null_ids(self, tmp_path):
         rows = _report_rows(3, 3)
         store = _report_rounds(tmp_path, rows)
