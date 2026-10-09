@@ -7,6 +7,7 @@ bootstrap 95% CI. No numpy/scipy/sklearn.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -200,14 +201,37 @@ def load_gold(path: str = GOLD_PATH) -> tuple[list[dict], dict]:
         raise ValueError(
             f"gold split drifted: {tally}, expected 29/205/8 over 242 rows"
         )
+    # Extension 1a: an unresolved prompt is excluded from every baseline's
+    # denominator (never score a prompt_preview). Gold is frozen resolved, so
+    # this is defensive and leaves the recorded arithmetic untouched.
     scored = [
         {"id": r["id"], "label": r["label"], "prompt": r["prompt"]}
         for r in rows
         if r["label"] != "excluded"
+        and r.get("prompt_status", "resolved") != "unresolved"
     ]
     if any(not r["prompt"] for r in scored):
         raise ValueError("empty prompt in scored gold rows — run C1 first")
     return scored, tally
+
+
+def load_gold_status_ids(path: str = GOLD_PATH) -> tuple[list[str], list[str]]:
+    """Ids the run report must list: (excluded, unresolved).
+
+    ``excluded`` rows carry the ``excluded`` label (ambiguous); ``unresolved``
+    rows carry ``prompt_status: unresolved`` (extension 1a). Both are absent
+    from ``load_gold``'s scored rows.
+    """
+    excluded: list[str] = []
+    unresolved: list[str] = []
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            if r.get("label") == "excluded":
+                excluded.append(r["id"])
+            if r.get("prompt_status", "resolved") == "unresolved":
+                unresolved.append(r["id"])
+    return excluded, unresolved
 
 
 def constant_prevalence_scores(rows: list[dict]) -> list[float]:
@@ -644,3 +668,502 @@ def combined_lexical_scores(rows: list[dict]) -> tuple[list[float], list[float]]
     y = [1 if r["label"] == "positive" else 0 for r in rows]
     weights = fit_logistic(X, y)
     return [logistic_score(weights, x) for x in X], weights
+
+
+# ---------------------------------------------------------------------------
+# Reporting (unit-004): metrics + per-row scores + run report + determinism
+# ---------------------------------------------------------------------------
+
+METRICS_PATH = Path(
+    os.environ.get("PROMPT_QUALITY_BASELINE_METRICS", "dataset/baseline-metrics.json")
+)
+SCORES_PATH = Path(
+    os.environ.get("PROMPT_QUALITY_BASELINE_SCORES", "dataset/baseline-scores.jsonl")
+)
+BASE_RATE_RESULTS_PATH = Path(
+    os.environ.get(
+        "PROMPT_QUALITY_BASE_RATE_RESULTS", "dataset/base-rate-results.jsonl"
+    )
+)
+
+# The jev variants, in emission order.
+JEV_VARIANTS = ("prompt_only", "own_response", "parent_response")
+
+
+def load_corpus_base_rate(path: str | Path = BASE_RATE_RESULTS_PATH) -> float:
+    """C2's corpus base-rate estimate: positive / (positive + negative) over
+    the adjudicated random sample.
+
+    Reuses C2's ``classify_bin`` (issue #2) rather than re-deriving the label
+    rule here; ``ambiguous`` is excluded from the denominator.
+    """
+    import importlib.util
+    import sys as _sys
+
+    module_path = Path(__file__).with_name("sample-base-rate.py")
+    name = "baselines_c2_sample"
+    if name not in _sys.modules:
+        spec = importlib.util.spec_from_file_location(name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        _sys.modules[name] = module
+        spec.loader.exec_module(module)
+    classify_bin = _sys.modules[name].classify_bin
+
+    positive = negative = 0
+    with open(path) as f:
+        for line in f:
+            row = json.loads(line)
+            kind = classify_bin(row.get("bin") or "ambiguous")
+            if kind == "positive":
+                positive += 1
+            elif kind == "negative":
+                negative += 1
+    if positive + negative == 0:
+        raise ValueError(f"no adjudicated rows in {path} — run C2 first")
+    return positive / (positive + negative)
+
+
+def _labels_of(rows: list[dict]) -> list[int]:
+    return [1 if r["label"] == "positive" else 0 for r in rows]
+
+
+def _records_to_vectors(
+    records: list[dict],
+) -> tuple[list[float], list[int], dict[str, list[str]]]:
+    """Split re-score records into (scores, labels, nulls-by-reason).
+
+    Null scores (extensions 4a/4b) are excluded from the baseline denominator
+    and returned keyed by their ``reason`` for the run report.
+    """
+    scores: list[float] = []
+    labels: list[int] = []
+    nulls: dict[str, list[str]] = {}
+    for r in records:
+        if r["score"] is None:
+            nulls.setdefault(r["reason"] or "unknown", []).append(r["id"])
+            continue
+        scores.append(r["score"])
+        labels.append(1 if r["label"] == "positive" else 0)
+    for ids in nulls.values():
+        ids.sort()
+    return scores, labels, nulls
+
+
+def baseline_metrics(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    corpus_base_rate: float,
+    n_boot: int = BOOTSTRAP_N,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict:
+    """AUC + FNR at the two declared operating points, each with a seeded
+    bootstrap 95% CI (issue #3 extension 2a).
+
+    FNR CIs re-derive the threshold inside each bootstrap resample, so the
+    interval carries threshold uncertainty as well as sampling noise. A
+    single-class score vector yields ``auc: null`` and null FNRs with a note
+    (extension 5a); only the full gold set is required to have both classes.
+    """
+    scores = list(scores)
+    labels = list(labels)
+    pos = sum(labels)
+    neg = len(labels) - pos
+    out: dict = {
+        "n": len(scores),
+        "positives": pos,
+        "negatives": neg,
+        "auc": None,
+        "fnr": None,
+    }
+    if pos == 0 or neg == 0:
+        out["note"] = "single-class stratum: AUC is null (extension 5a)"
+        return out
+    out["auc"] = bootstrap_ci(scores, labels, auc, n_boot, seed)
+
+    def fnr_at_youden(s: Sequence[float], l: Sequence[int]) -> float | None:
+        try:
+            return fnr(s, l, youden_threshold(s, l))
+        except ValueError:
+            return None
+
+    def fnr_at_base_rate(s: Sequence[float], l: Sequence[int]) -> float | None:
+        try:
+            return fnr(s, l, base_rate_threshold(s, l, corpus_base_rate))
+        except ValueError:
+            return None
+
+    def _point_and_ci(metric: Callable) -> dict:
+        ci = bootstrap_ci(scores, labels, metric, n_boot, seed)
+        return {
+            "point": metric(scores, labels),
+            "ci95": ci["ci95"] if ci else None,
+        }
+
+    out["fnr"] = {
+        "youden_j": {
+            "threshold": youden_threshold(scores, labels),
+            **_point_and_ci(fnr_at_youden),
+        },
+        "corpus_base_rate": {
+            "threshold": base_rate_threshold(scores, labels, corpus_base_rate),
+            **_point_and_ci(fnr_at_base_rate),
+        },
+    }
+    return out
+
+
+def paired_auc_delta(
+    records_a: list[dict],
+    records_b: list[dict],
+    n_boot: int = BOOTSTRAP_N,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict:
+    """AUC(records_b) - AUC(records_a) over the rows valid in *both* variants.
+
+    Unpairable rows (a null score or a missing round file, extensions 4a/4b)
+    are excluded from the delta only and listed by the caller's run report;
+    the absolute baselines keep their own denominators.
+    """
+    b_by_id = {r["id"]: r for r in records_b}
+    left: list[float] = []
+    right: list[float] = []
+    labels: list[int] = []
+    for r in records_a:
+        other = b_by_id.get(r["id"])
+        if other is None or r["score"] is None or other["score"] is None:
+            continue
+        left.append(r["score"])
+        right.append(other["score"])
+        labels.append(1 if r["label"] == "positive" else 0)
+
+    def delta(sl: Sequence[float], sr: Sequence[float], lb: Sequence[int]) -> float | None:
+        a = auc(sl, lb)
+        c = auc(sr, lb)
+        if a is None or c is None:
+            return None
+        return c - a
+
+    if not left:
+        return {"point": None, "ci95": None, "n_pairs": 0, "seed": seed}
+    rng = random.Random(seed)
+    n = len(left)
+    values: list[float] = []
+    for _ in range(n_boot):
+        idx = [rng.randrange(n) for _ in range(n)]
+        v = delta(
+            [left[i] for i in idx],
+            [right[i] for i in idx],
+            [labels[i] for i in idx],
+        )
+        if v is not None:
+            values.append(v)
+    ci95 = None
+    if len(values) >= n_boot // 2:
+        values.sort()
+        ci95 = [
+            values[int(0.025 * len(values))],
+            values[min(len(values) - 1, int(0.975 * len(values)))],
+        ]
+    return {
+        "point": delta(left, right, labels),
+        "ci95": ci95,
+        "n_pairs": n,
+        "seed": seed,
+        "n_boot": n_boot,
+    }
+
+
+def _feature_definitions() -> dict:
+    """The feature definitions printed into the metrics file (extension 3a)."""
+    return {
+        "length": {
+            "description": "whitespace-token count of the prompt (chars also recorded)",
+            "units": "tokens",
+        },
+        "imperative_density": {
+            "description": "fraction of clauses whose first token is an imperative verb",
+            "imperative_verbs": sorted(IMPERATIVE_VERBS),
+            "empty_prompt_score": 0.0,
+        },
+        "deixis": {
+            "description": "deictic/back-reference marker count per 100 tokens",
+            "markers": list(DEICTIC_MARKERS),
+            "empty_prompt_score": 0.0,
+        },
+        "output_contract_absence": {
+            "description": (
+                "1 when the prompt states no explicit deliverable (no file path, "
+                "no format word, no acceptance/'must' phrasing), else 0"
+            ),
+            "format_words": sorted(FORMAT_WORDS),
+            "contract_phrases": list(CONTRACT_PHRASES),
+            "unmatched_prompt_score": 0.0,
+        },
+    }
+
+
+def _score_rows(
+    rows: list[dict],
+    lexical_scores: list[float],
+    base_scores: list[float],
+    jev: dict[str, list[dict]],
+) -> list[dict]:
+    """Per-row score dump for C4/C5/C6: gold identity, lexical features,
+    combiner score, and every jev variant score (nulls kept, with reason)."""
+    by_variant = {v: {r["id"]: r for r in jev[v]} for v in JEV_VARIANTS}
+    out: list[dict] = []
+    for row, lex, base in zip(rows, lexical_scores, base_scores):
+        rid = row["id"]
+        rec: dict = {
+            "id": rid,
+            "label": row["label"],
+            "base_rate": base,
+            "lexical_combined": lex,
+        }
+        for name, value in lexical_features(row["prompt"]).items():
+            rec[f"feat_{name}"] = value
+        for variant in JEV_VARIANTS:
+            j = by_variant[variant][rid]
+            rec[f"jev_{variant}"] = j["score"]
+            rec[f"jev_{variant}_reason"] = j["reason"]
+            if j["score"] is not None:
+                rec[f"jev_{variant}_correction"] = j["correction"]
+                rec[f"jev_{variant}_frustration"] = j["frustration"]
+        out.append(rec)
+    return out
+
+
+def assemble_baselines(
+    rows: list[dict],
+    corpus_base_rate: float,
+    cache: dict[str, str],
+    api_key: str | None = None,
+    query_fn: Callable[..., dict] = query_jev,
+    round_store: str | Path = ROUND_STORE,
+    questions: dict | None = None,
+    excluded_ids: list[str] | None = None,
+    unresolved_ids: list[str] | None = None,
+    n_boot: int = BOOTSTRAP_N,
+    seed: int = BOOTSTRAP_SEED,
+) -> tuple[dict, list[dict]]:
+    """Assemble the metrics document and per-row score dump.
+
+    Pure with respect to disk except for ``cache``, which ``rescore_rows``
+    fills in place; the caller persists it. With a warm cache the call is
+    offline and deterministic (extension 7a).
+    """
+    labels = _labels_of(rows)
+    lexical_scores, weights = combined_lexical_scores(rows)
+    base_scores = constant_prevalence_scores(rows)
+    jev = {
+        v: rescore_rows(
+            rows, v, cache, api_key, query_fn, round_store, questions
+        )
+        for v in JEV_VARIANTS
+    }
+
+    jev_vectors = {v: _records_to_vectors(jev[v]) for v in JEV_VARIANTS}
+    baselines_out = {
+        "base_rate": baseline_metrics(base_scores, labels, corpus_base_rate, n_boot, seed),
+        "lexical": baseline_metrics(lexical_scores, labels, corpus_base_rate, n_boot, seed),
+    }
+    for variant in JEV_VARIANTS:
+        scores, labs, _ = jev_vectors[variant]
+        baselines_out[f"jev_{variant}"] = baseline_metrics(
+            scores, labs, corpus_base_rate, n_boot, seed
+        )
+
+    prompt_only = jev["prompt_only"]
+    deltas = {
+        "leak": paired_auc_delta(prompt_only, jev["own_response"], n_boot, seed),
+        "session": paired_auc_delta(prompt_only, jev["parent_response"], n_boot, seed),
+    }
+
+    null_scores = {v: jev_vectors[v][2] for v in JEV_VARIANTS}
+    delta_exclusions = {
+        "leak": sorted(
+            {
+                r["id"]
+                for r in jev["own_response"]
+                if r["score"] is None
+            }
+            | {r["id"] for r in prompt_only if r["score"] is None}
+        ),
+        "session": sorted(
+            {
+                r["id"]
+                for r in jev["parent_response"]
+                if r["score"] is None
+            }
+            | {r["id"] for r in prompt_only if r["score"] is None}
+        ),
+    }
+
+    metrics: dict = {
+        "seed": seed,
+        "n_boot": n_boot,
+        "corpus_base_rate_target": corpus_base_rate,
+        "inputs": {
+            "gold": str(GOLD_PATH),
+            "base_rate_results": str(BASE_RATE_RESULTS_PATH),
+            "round_store": str(round_store),
+        },
+        "gold": {
+            "scored_rows": len(rows),
+            "positives": labels.count(1),
+            "negatives": labels.count(0),
+        },
+        "feature_definitions": _feature_definitions(),
+        "lexical_weights": dict(zip(FEATURE_NAMES, weights)),
+        "jev": {
+            "model": JEV_MODEL,
+            "state_chars": JEV_STATE_CHARS,
+            "response_marker": RESPONSE_MARKER,
+            "score_definition": "max(correction.noul, frustration.score / 4)",
+        },
+        "baselines": baselines_out,
+        "deltas": deltas,
+        "run_report": {
+            "excluded_ids": sorted(excluded_ids or []),
+            "unresolved_ids": sorted(unresolved_ids or []),
+            "null_scores": null_scores,
+            "delta_exclusions": delta_exclusions,
+            "thresholds_used": {
+                name: {
+                    "youden_j": entry["fnr"]["youden_j"]["threshold"],
+                    "corpus_base_rate": entry["fnr"]["corpus_base_rate"]["threshold"],
+                }
+                for name, entry in baselines_out.items()
+                if entry.get("fnr")
+            },
+        },
+    }
+    return metrics, _score_rows(rows, lexical_scores, base_scores, jev)
+
+
+def serialize_metrics(metrics: dict) -> str:
+    """Deterministic JSON rendering (sorted keys, 2-space indent, newline)."""
+    return json.dumps(metrics, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+
+
+def serialize_score_rows(rows: list[dict]) -> str:
+    """Deterministic JSONL rendering (sorted keys, one row per line)."""
+    return "".join(
+        json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in rows
+    )
+
+
+def _first_divergent_path(a, b, prefix: str = "") -> str:
+    """Name the first field where two parsed structures differ.
+
+    Used so extension 7a's failure says *which* number/row drifted rather
+    than just that bytes differ.
+    """
+    if type(a) is not type(b):
+        return prefix or "$type"
+    if isinstance(a, dict):
+        for key in sorted(set(a) | set(b)):
+            if key not in a or key not in b:
+                return f"{prefix}.{key}" if prefix else key
+            if a[key] != b[key]:
+                child = f"{prefix}.{key}" if prefix else key
+                return _first_divergent_path(a[key], b[key], child)
+        return prefix
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return prefix or "$length"
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                child = f"{prefix}[{i}]" if prefix else f"[{i}]"
+                return _first_divergent_path(x, y, child)
+        return prefix
+    return prefix or "$value"
+
+
+def emit_artifacts(
+    metrics: dict,
+    score_rows: list[dict],
+    metrics_path: str | Path = METRICS_PATH,
+    scores_path: str | Path = SCORES_PATH,
+) -> dict[str, Path]:
+    """Write both artifacts, failing loudly if a prior identical-input run
+    would now differ (extension 7a names the drifting field).
+
+    The comparison is against the existing file rather than an in-memory
+    re-serialization: it catches cross-run drift (ordering, numeric noise)
+    that an in-process double-serialize cannot.
+    """
+    metrics_path = Path(metrics_path)
+    scores_path = Path(scores_path)
+    new_metrics = serialize_metrics(metrics)
+    new_scores = serialize_score_rows(score_rows)
+
+    if metrics_path.exists():
+        old = metrics_path.read_text(encoding="utf-8")
+        if old != new_metrics:
+            field = _first_divergent_path(json.loads(old), json.loads(new_metrics))
+            raise RuntimeError(
+                f"non-deterministic output in {metrics_path.name}: {field}"
+            )
+    if scores_path.exists():
+        old = scores_path.read_text(encoding="utf-8")
+        if old != new_scores:
+            old_lines = old.splitlines()
+            new_lines = new_scores.splitlines()
+            for i, (x, y) in enumerate(zip(old_lines, new_lines)):
+                if x != y:
+                    rid = json.loads(x).get("id", "?")
+                    raise RuntimeError(
+                        f"non-deterministic output in {scores_path.name}: "
+                        f"row {rid} (line {i})"
+                    )
+            raise RuntimeError(
+                f"non-deterministic output in {scores_path.name}: row count"
+            )
+
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(new_metrics, encoding="utf-8")
+    scores_path.write_text(new_scores, encoding="utf-8")
+    return {"metrics": metrics_path, "scores": scores_path}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run C3 end-to-end: score gold, emit metrics + per-row scores.
+
+    A warm jev cache makes the run offline; newly fetched API results are
+    persisted so the next run is deterministic (extension 7a).
+    """
+    parser = argparse.ArgumentParser(description="C3 — Baselines (E2)")
+    parser.add_argument("--gold", default=GOLD_PATH)
+    parser.add_argument("--base-rate-results", default=str(BASE_RATE_RESULTS_PATH))
+    parser.add_argument("--cache", default=str(JEV_CACHE_PATH))
+    parser.add_argument("--metrics", default=str(METRICS_PATH))
+    parser.add_argument("--scores", default=str(SCORES_PATH))
+    parser.add_argument("--round-store", default=str(ROUND_STORE))
+    parser.add_argument("--api-key", default=os.environ.get("OPENROUTER_API_KEY"))
+    args = parser.parse_args(argv)
+
+    rows, _tally = load_gold(args.gold)
+    excluded_ids, unresolved_ids = load_gold_status_ids(args.gold)
+    corpus_base_rate = load_corpus_base_rate(args.base_rate_results)
+    cache = load_jev_cache(args.cache)
+    metrics, score_rows = assemble_baselines(
+        rows,
+        corpus_base_rate,
+        cache,
+        api_key=args.api_key,
+        round_store=args.round_store,
+        excluded_ids=excluded_ids,
+        unresolved_ids=unresolved_ids,
+    )
+    save_jev_cache(cache, args.cache)
+    paths = emit_artifacts(metrics, score_rows, args.metrics, args.scores)
+    print(
+        f"wrote {paths['metrics']} and {paths['scores']} "
+        f"(cache {len(cache)} entries, base rate {corpus_base_rate:.4f})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

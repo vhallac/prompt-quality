@@ -18,22 +18,29 @@ _spec.loader.exec_module(baselines)
 
 from baselines import (
     FEATURE_NAMES,
+    JEV_VARIANTS,
     RESPONSE_MARKER,
+    assemble_baselines,
     auc,
     base_rate_threshold,
+    baseline_metrics,
     bootstrap_ci,
     combined_lexical_scores,
     constant_prevalence_scores,
     deixis_density,
+    emit_artifacts,
     fit_logistic,
     fnr,
     imperative_density,
     length_feature,
     lexical_features,
+    load_corpus_base_rate,
     load_gold,
+    load_gold_status_ids,
     logistic_score,
     operating_points,
     output_contract_absence,
+    paired_auc_delta,
     parent_response_state,
     prompt_only_state,
     jev_flag_score,
@@ -44,6 +51,8 @@ from baselines import (
     rescore_rows,
     save_jev_cache,
     sensitivity,
+    serialize_metrics,
+    serialize_score_rows,
     specificity,
     youden_threshold,
 )
@@ -513,3 +522,189 @@ def test_jev_cache_key_is_stable_and_separates_states(tmp_path):
     assert jev_cache_key("s1") != jev_cache_key("s2")
     # model separates keys
     assert jev_cache_key("s1", "m1") != jev_cache_key("s1", "m2")
+
+
+# ---------------------------------------------------------------------------
+# unit-004: reporting + determinism
+# ---------------------------------------------------------------------------
+
+
+def _report_rows(n_pos: int = 6, n_neg: int = 6) -> list[dict]:
+    rows = [
+        {"id": f"p{i:02d}", "label": "positive", "prompt": f"fix the file p{i:02d}"}
+        for i in range(n_pos)
+    ]
+    rows += [
+        {"id": f"n{i:02d}", "label": "negative", "prompt": f"hello there n{i:02d}"}
+        for i in range(n_neg)
+    ]
+    return rows
+
+
+def _report_rounds(tmp_path: Path, rows: list[dict]) -> Path:
+    store = tmp_path / "rounds"
+    store.mkdir()
+    for r in rows:
+        (store / f"{r['id']}.json").write_text(
+            json.dumps(
+                {"responseSequence": f"response for {r['id']}", "parentId": "sharedparent"}
+            )
+        )
+    (store / "sharedparent.json").write_text(
+        json.dumps({"responseSequence": "parent response text"})
+    )
+    return store
+
+
+def _report_query(state, api_key=None, questions=None):
+    return {
+        "correction": {"noul": 0.9 if "fix" in state else 0.1},
+        "frustration": {"score": 1.0},
+    }
+
+
+class TestReporting:
+    def test_report_metrics_has_all_baselines_and_deltas(self, tmp_path):
+        rows = _report_rows()
+        store = _report_rounds(tmp_path, rows)
+        metrics, score_rows = assemble_baselines(
+            rows, 0.2, {}, query_fn=_report_query, round_store=store
+        )
+        expected = {"base_rate", "lexical", *[f"jev_{v}" for v in JEV_VARIANTS]}
+        assert set(metrics["baselines"]) == expected
+        assert set(metrics["deltas"]) == {"leak", "session"}
+        assert metrics["feature_definitions"]["imperative_density"]["imperative_verbs"]
+        assert metrics["feature_definitions"]["deixis"]["markers"]
+        assert metrics["lexical_weights"].keys() == set(FEATURE_NAMES)
+        assert set(metrics["run_report"]["thresholds_used"]) == expected
+        # per-row dump carries every score C4/C5/C6 reuse
+        assert len(score_rows) == 12
+        assert {
+            "base_rate",
+            "lexical_combined",
+            "feat_deixis",
+            "jev_prompt_only",
+            "jev_own_response",
+            "jev_parent_response",
+        } <= set(score_rows[0])
+
+    def test_report_lists_excluded_unresolved_and_null_ids(self, tmp_path):
+        rows = _report_rows(3, 3)
+        store = _report_rounds(tmp_path, rows)
+        (store / f"{rows[-1]['id']}.json").unlink()
+
+        def q(state, api_key=None, questions=None):
+            if "p00" in state:
+                raise OSError("boom")
+            return _report_query(state)
+
+        metrics, _ = assemble_baselines(
+            rows,
+            0.2,
+            {},
+            query_fn=q,
+            round_store=store,
+            excluded_ids=["ex1"],
+            unresolved_ids=["un1"],
+        )
+        rr = metrics["run_report"]
+        assert rr["excluded_ids"] == ["ex1"]
+        assert rr["unresolved_ids"] == ["un1"]
+        assert "p00" in rr["null_scores"]["prompt_only"]["api_error"]
+        assert "missing_round" in rr["null_scores"]["own_response"]
+        assert rows[-1]["id"] in rr["null_scores"]["own_response"]["missing_round"]
+
+    def test_report_deltas_pair_only_valid_rows(self, tmp_path):
+        rows = _report_rows(3, 3)
+        store = _report_rounds(tmp_path, rows)
+        (store / f"{rows[0]['id']}.json").unlink()
+        metrics, _ = assemble_baselines(
+            rows, 0.2, {}, query_fn=_report_query, round_store=store
+        )
+        assert metrics["deltas"]["leak"]["n_pairs"] == 5
+        assert metrics["deltas"]["session"]["n_pairs"] == 5
+        assert rows[0]["id"] in metrics["run_report"]["delta_exclusions"]["leak"]
+        assert rows[0]["id"] in metrics["run_report"]["delta_exclusions"]["session"]
+
+    def test_report_unresolved_prompt_excluded_from_scored_rows(self, tmp_path):
+        rows = []
+        for i in range(29):
+            rows.append(
+                {"id": f"p{i}", "label": "positive", "prompt": "fix", "prompt_status": "resolved"}
+            )
+        for i in range(205):
+            rows.append(
+                {"id": f"n{i}", "label": "negative", "prompt": "hello", "prompt_status": "resolved"}
+            )
+        rows[29]["prompt_status"] = "unresolved"
+        for i in range(8):
+            rows.append(
+                {"id": f"e{i}", "label": "excluded", "prompt": "", "prompt_status": "resolved"}
+            )
+        path = tmp_path / "gold.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        scored, tally = load_gold(str(path))
+        assert len(scored) == 233
+        assert tally["negative"] == 205
+        _, unresolved = load_gold_status_ids(str(path))
+        assert unresolved == [rows[29]["id"]]
+
+
+class TestReportDeterminism:
+    def test_report_determinism_with_warm_cache(self, tmp_path):
+        rows = _report_rows(3, 3)
+        store = _report_rounds(tmp_path, rows)
+        cache: dict = {}
+        calls = {"n": 0}
+
+        def q(state, api_key=None, questions=None):
+            calls["n"] += 1
+            return _report_query(state)
+
+        m1, s1 = assemble_baselines(
+            rows, 0.2, cache, query_fn=q, round_store=store
+        )
+        assert calls["n"] > 0  # cold cache hits the API
+        first_calls = calls["n"]
+        m2, s2 = assemble_baselines(
+            rows, 0.2, cache, query_fn=q, round_store=store
+        )
+        assert calls["n"] == first_calls  # warm cache: fully offline
+        assert serialize_metrics(m1) == serialize_metrics(m2)
+        assert serialize_score_rows(s1) == serialize_score_rows(s2)
+
+    def test_report_empty_cold_cache_emits_byte_identical(self, tmp_path):
+        rows = _report_rows(3, 3)
+        store = _report_rounds(tmp_path, rows)
+        cache: dict = {}
+        m1, s1 = assemble_baselines(rows, 0.2, cache, query_fn=_report_query, round_store=store)
+        assert cache  # cold cache was populated
+        m2, s2 = assemble_baselines(rows, 0.2, cache, query_fn=_report_query, round_store=store)
+        mp, sp = tmp_path / "metrics.json", tmp_path / "scores.jsonl"
+        p1 = emit_artifacts(m1, s1, mp, sp)
+        # same content emitted again must not raise (extension 7a)
+        emit_artifacts(m2, s2, mp, sp)
+        assert p1["metrics"].read_bytes() == serialize_metrics(m1).encode()
+        assert p1["scores"].read_bytes() == serialize_score_rows(s1).encode()
+
+    def test_determinism_fails_naming_drifting_field(self, tmp_path):
+        rows = _report_rows(3, 3)
+        store = _report_rounds(tmp_path, rows)
+        m, s = assemble_baselines(rows, 0.2, {}, query_fn=_report_query, round_store=store)
+        mp, sp = tmp_path / "metrics.json", tmp_path / "scores.jsonl"
+        emit_artifacts(m, s, mp, sp)
+        drifted = json.loads(serialize_metrics(m))
+        drifted["baselines"]["lexical"]["auc"]["point"] += 0.01
+        with pytest.raises(RuntimeError, match=r"baselines\.lexical\.auc\.point"):
+            emit_artifacts(drifted, s, mp, sp)
+
+    def test_determinism_fails_naming_drifting_score_row(self, tmp_path):
+        rows = _report_rows(3, 3)
+        store = _report_rounds(tmp_path, rows)
+        m, s = assemble_baselines(rows, 0.2, {}, query_fn=_report_query, round_store=store)
+        mp, sp = tmp_path / "metrics.json", tmp_path / "scores.jsonl"
+        emit_artifacts(m, s, mp, sp)
+        drifted = [dict(r) for r in s]
+        drifted[0]["lexical_combined"] = drifted[0]["lexical_combined"] + 0.5
+        with pytest.raises(RuntimeError, match=drifted[0]["id"]):
+            emit_artifacts(m, drifted, mp, sp)
