@@ -21,6 +21,8 @@ from baselines import (
     FEATURE_NAMES,
     JEV_VARIANTS,
     RESPONSE_MARKER,
+    alarm_rate,
+    alarm_rate_tolerance,
     assemble_baselines,
     auc,
     base_rate_threshold,
@@ -141,6 +143,81 @@ class TestMetricsOperatingPoints:
         labels = [0, 0, 1, 1]
         ops = operating_points(scores, labels, corpus_base_rate=0.25)
         assert set(ops) == {"youden_j", "corpus_base_rate"}
+
+
+class TestAlarmRateDisclosure:
+    """F4: each FNR cell states the alarm rate it achieved, not only the one it aimed at."""
+
+    def test_alarm_rate_primitive_counts_all_rows(self):
+        scores = [0.1, 0.2, 0.3, 0.4]
+        assert alarm_rate(scores, 0.3) == pytest.approx(0.5)
+        assert alarm_rate(scores, math.nextafter(0.4, math.inf)) == 0.0
+        with pytest.raises(ValueError, match="no rows"):
+            alarm_rate([], 0.5)
+
+    def test_alarm_rate_tolerance_is_half_the_rate_grid_step(self):
+        assert alarm_rate_tolerance(4) == pytest.approx(0.125)
+        with pytest.raises(ValueError, match="empty vector"):
+            alarm_rate_tolerance(0)
+
+    def test_both_operating_points_disclose_achieved_alarm_rate(self):
+        scores = [0.1 * i for i in range(1, 21)]
+        labels = [1 if i % 3 == 0 else 0 for i in range(20)]
+        m = baseline_metrics(scores, labels, corpus_base_rate=0.3, n_boot=50, seed=3)
+        for name in ("youden_j", "corpus_base_rate"):
+            cell = m["fnr"][name]
+            assert cell["achieved_alarm_rate"] == pytest.approx(
+                alarm_rate(scores, cell["threshold"])
+            )
+        # (i) targets Youden's J, not a rate; only (ii) declares a target.
+        assert m["fnr"]["youden_j"]["target_alarm_rate"] is None
+        assert "alarm_rate_tolerance" not in m["fnr"]["youden_j"]
+        assert m["fnr"]["corpus_base_rate"]["target_alarm_rate"] == pytest.approx(0.3)
+        assert m["fnr"]["corpus_base_rate"]["alarm_rate_tolerance"] == pytest.approx(
+            alarm_rate_tolerance(20)
+        )
+
+    def test_alarm_rate_disclosure_does_not_move_threshold_or_fnr(self):
+        # Disclosure must not change selection: the published threshold and FNR
+        # point are exactly what the untouched selectors produce.
+        scores = [0.05, 0.05, 0.2, 0.4, 0.6, 0.9]
+        labels = [0, 1, 0, 1, 0, 1]
+        m = baseline_metrics(scores, labels, corpus_base_rate=0.5, n_boot=20, seed=11)
+        ty = youden_threshold(scores, labels)
+        tb = base_rate_threshold(scores, labels, 0.5)
+        assert m["fnr"]["youden_j"]["threshold"] == ty
+        assert m["fnr"]["corpus_base_rate"]["threshold"] == tb
+        assert m["fnr"]["youden_j"]["point"] == pytest.approx(fnr(scores, labels, ty))
+        assert m["fnr"]["corpus_base_rate"]["point"] == pytest.approx(
+            fnr(scores, labels, tb)
+        )
+
+    def test_reachable_target_alarm_rate_is_not_marked(self):
+        # n=8 → tolerance 0.0625; 4/8 rows alarmed hits the 0.5 target exactly.
+        scores = [0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9]
+        labels = [0, 1, 0, 1, 0, 1, 0, 1]
+        m = baseline_metrics(scores, labels, corpus_base_rate=0.5, n_boot=20, seed=2)
+        cell = m["fnr"]["corpus_base_rate"]
+        assert cell["achieved_alarm_rate"] == pytest.approx(0.5)
+        assert "note" not in cell
+
+    def test_unreachable_target_alarm_rate_is_marked_non_rate_matched(self):
+        # The prevalence floor: one distinct score, so the only reachable rates
+        # are 1.0 and 0.0 and the 0.1939 target cannot be met.
+        scores = [0.12393162393162394] * 20
+        labels = [1, 0] * 10
+        m = baseline_metrics(
+            scores, labels, corpus_base_rate=0.19387755102040816, n_boot=20, seed=4
+        )
+        cell = m["fnr"]["corpus_base_rate"]
+        assert cell["target_alarm_rate"] == pytest.approx(0.19387755102040816)
+        assert cell["achieved_alarm_rate"] == 0.0
+        assert cell["point"] == 1.0
+        note = cell["note"]
+        assert "non-rate-matched" in note
+        assert "alarms nothing" in note
+        assert f"{cell['alarm_rate_tolerance']:.6g}" in note
+        assert "1 distinct value" in note
 
 
 class TestMetricsBootstrapCi:

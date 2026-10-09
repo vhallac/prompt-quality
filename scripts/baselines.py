@@ -64,6 +64,34 @@ def specificity(scores: Sequence[float], labels: Sequence[int], threshold: float
     return 1.0 - alarmed / len(neg)
 
 
+def alarm_rate(scores: Sequence[float], threshold: float) -> float:
+    """Fraction of rows alarmed at `threshold` (alarm rule: score >= threshold).
+
+    The denominator is **all** rows, which is how operating point (ii) states its
+    target (issue #3: "the threshold whose alarm rate equals the C2 corpus
+    base-rate estimate"). ``specificity`` divides by the negative rows only; the
+    two are not interchangeable.
+    """
+    if not scores:
+        raise ValueError("alarm rate undefined: no rows")
+    return sum(1 for s in scores if s >= threshold) / len(scores)
+
+
+def alarm_rate_tolerance(n: int) -> float:
+    """Stated rate-matching tolerance for operating point (ii): ``0.5 / n``.
+
+    Candidate thresholds are midpoints between distinct scores, so the alarm
+    rates an n-row vector can express are multiples of ``1/n`` at best; half that
+    step is the smallest error any selection rule can guarantee. A target missed
+    by more than this is not a rounding artefact: the score vector cannot reach
+    that rate at all. Ties collapse the reachable set, and a constant-score
+    vector (the prevalence floor baseline) can only alarm everything or nothing.
+    """
+    if n <= 0:
+        raise ValueError("alarm rate tolerance undefined for an empty vector")
+    return 0.5 / n
+
+
 def _candidate_thresholds(scores: Sequence[float]) -> list[float]:
     """Deterministic candidates: midpoints between sorted unique scores,
     plus an extreme low endpoint that alarms everything and an extreme high
@@ -99,7 +127,9 @@ def base_rate_threshold(
     """
     best: tuple[float, float] | None = None  # (|rate - target|, threshold)
     for t in _candidate_thresholds(scores):
-        alarmed = sum(1 for s in scores if s >= t) / len(scores)
+        # Same primitive the disclosure publishes, so the rate the selection was
+        # scored on can never drift from the rate the cell reports.
+        alarmed = alarm_rate(scores, t)
         d = abs(alarmed - target_rate)
         if best is None or d < best[0] or (d == best[0] and t < best[1]):
             best = (d, t)
@@ -786,6 +816,14 @@ def baseline_metrics(
     interval carries threshold uncertainty as well as sampling noise. A
     single-class score vector yields ``auc: null`` and null FNRs with a note
     (extension 5a); only the full gold set is required to have both classes.
+
+    Every FNR cell discloses the alarm rate it actually achieved. Operating point
+    (i) has no rate target (it targets Youden's J), so its ``target_alarm_rate``
+    is null. Point (ii) does, and when the achieved rate misses it by more than
+    the stated ``alarm_rate_tolerance`` the cell carries a note naming the
+    degeneracy: nearest-candidate selection is then reporting the closest
+    reachable rate, not the declared one. Threshold *selection* is unchanged, so
+    no published threshold or FNR moves.
     """
     scores = list(scores)
     labels = list(labels)
@@ -822,13 +860,43 @@ def baseline_metrics(
             "ci95": ci["ci95"] if ci else None,
         }
 
+    def _rate_disclosure(threshold: float, target: float | None) -> dict:
+        achieved = alarm_rate(scores, threshold)
+        cell: dict = {
+            "target_alarm_rate": target,
+            "achieved_alarm_rate": achieved,
+        }
+        if target is None:
+            return cell
+        tolerance = alarm_rate_tolerance(len(scores))
+        cell["alarm_rate_tolerance"] = tolerance
+        if abs(achieved - target) > tolerance:
+            if achieved == 0.0:
+                reached = "the threshold alarms nothing, so FNR is 1.0 by construction"
+            elif achieved == 1.0:
+                reached = "the threshold alarms every row, so FNR is 0.0 by construction"
+            else:
+                reached = f"the threshold alarms {achieved:.6g} of rows"
+            cell["note"] = (
+                "non-rate-matched operating point (ii): achieved alarm rate "
+                f"{achieved:.6g} vs target {target:.6g} misses by more than the "
+                f"stated {tolerance:.6g} tolerance; the score vector has only "
+                f"{len(set(scores))} distinct value(s) so the target rate is "
+                f"unreachable and the nearest candidate was selected \u2014 {reached}"
+            )
+        return cell
+
+    threshold_youden = youden_threshold(scores, labels)
+    threshold_base_rate = base_rate_threshold(scores, labels, corpus_base_rate)
     out["fnr"] = {
         "youden_j": {
-            "threshold": youden_threshold(scores, labels),
+            "threshold": threshold_youden,
+            **_rate_disclosure(threshold_youden, None),
             **_point_and_ci(fnr_at_youden),
         },
         "corpus_base_rate": {
-            "threshold": base_rate_threshold(scores, labels, corpus_base_rate),
+            "threshold": threshold_base_rate,
+            **_rate_disclosure(threshold_base_rate, corpus_base_rate),
             **_point_and_ci(fnr_at_base_rate),
         },
     }
