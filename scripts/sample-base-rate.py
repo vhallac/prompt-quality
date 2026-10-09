@@ -554,7 +554,7 @@ def summarize(rows: Iterable[dict], unresolved: Iterable[str] = ()) -> dict:
         "ambiguous": bin_counts.get("ambiguous", 0),
         "excluded": class_counts["excluded"],
         "external": bin_counts.get("external", 0),
-        "unresolved": sorted(unresolved),
+        "unresolved": sorted(set(unresolved)),
     }
 
 
@@ -592,21 +592,29 @@ def build_report(
 def backfill_ids(
     manifest: dict,
     results: Iterable[dict],
+    unresolved: Iterable[str] = (),
     corpus_path: str | Path = DEFAULT_CORPUS,
     gold_path: str | Path = DEFAULT_GOLD,
     round_store: str | Path = DEFAULT_ROUND_STORE,
     drop_ids: Iterable[str] = DROP_IDS,
 ) -> list[str]:
-    """Draw replacement ids for sampled ids that have no round file.
+    """Draw replacement ids for sampled ids with no usable result.
 
     Issue #2 extension 1a: an unresolvable sampled id is dropped and replaced
-    by the next eligible id, so the adjudicated count still reaches 100. The
-    replacements come from the full eligible frame (a superset of the sample)
-    and exclude every id already sampled, adjudicated, or drawn as a
+    by the next eligible id, so the adjudicated count still reaches 100. Two
+    kinds of id are unresolvable: those with no round file (``missing_ids`` on
+    the manifest) and those the live pass saw fail (``unresolved`` — e.g. a
+    round whose LLM reply was unusable). Both need a replacement, so the
+    caller supplies the live unresolved set and it is unioned with the
+    manifest's missing set.
+
+    The replacements come from the full eligible frame (a superset of the
+    sample) and exclude every id already sampled, adjudicated, or drawn as a
     replacement, so no id is used twice. Order is deterministic given the
     manifest's seed.
     """
     missing = set(manifest.get("missing_ids", []))
+    missing |= set(unresolved)
     sampled = manifest.get("sampled_ids", [])
     unresolved = [rid for rid in sampled if rid in missing]
     if not unresolved:
@@ -630,17 +638,19 @@ def run_adjudication(
     results: Iterable[dict] = (),
     adjudicate: Callable[[str], dict] | None = None,
     append: Callable[[dict], bool] | None = None,
-    backfill: Callable[[dict, Iterable[dict]], list[str]] | None = None,
+    backfill: Callable[[dict, Iterable[dict], Iterable[str]], list[str]] | None = None,
     min_rows: int = MIN_ROWS,
     max_rounds: int = 5,
 ) -> dict:
     """Drive adjudication over the manifest, backfilling to reach ``min_rows``.
 
     Walks the resume plan (manifest minus already-done ids), adjudicates each
-    id, and appends the result. Ids whose round file is missing are dropped and
+    id, and appends the result. Ids whose round file is missing — or whose
+    adjudication raised :class:`AdjudicationUnavailable` — are dropped and
     replaced by drawing from the remaining eligible pool, repeating until the
     adjudicated count reaches ``min_rows`` or the backfill pool dries up
-    (issue #2 extension 1a). Returns the final run report.
+    (issue #2 extension 1a). The live unresolved set is passed to ``backfill``
+    so a failed replacement is itself replaced. Returns the final run report.
 
     ``adjudicate``, ``append``, and ``backfill`` are injectable so the loop is
     exercised fully offline; the defaults wire the real S2 adapter, transcript,
@@ -666,7 +676,7 @@ def run_adjudication(
         done = {row["id"] for row in all_results}
         if len(done) >= min_rows:
             break
-        replacements = backfill(manifest, all_results)
+        replacements = backfill(manifest, all_results, unresolved)
         todo = [rid for rid in replacements if rid not in done]
         if not todo:
             break

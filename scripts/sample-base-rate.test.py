@@ -487,6 +487,17 @@ def test_summarize_records_unresolved_sorted() -> None:
     assert report["unresolved"] == ["a", "z"]
 
 
+def test_summarize_unresolved_is_deduplicated() -> None:
+    """F2 regression: a repeatedly-failing id appears once, not once per pass.
+
+    ``run_adjudication`` appends to the unresolved list on every failed
+    adjudication, so a persisted failure (or a replacement that also fails)
+    would repeat the same id. The report must list distinct ids.
+    """
+    report = sbr.summarize([], unresolved=["b", "a", "b", "b", "b"])
+    assert report["unresolved"] == ["a", "b"]
+
+
 def test_build_report_fails_loudly_below_min_rows() -> None:
     rows = [{"id": str(i), "bin": "no-fault-within-round"} for i in range(3)]
     with pytest.raises(SystemExit) as excinfo:
@@ -541,6 +552,33 @@ def test_backfill_replaces_unresolved_ids(tmp_path: Path) -> None:
     # Replacements are drawn from the frame, not from the dropped ids.
     assert set(replacements).isdisjoint({"c1", "c2"})
     assert set(replacements) <= set(corpus)
+
+
+def test_backfill_ids_counts_live_unresolved(tmp_path: Path) -> None:
+    """F1 regression at the seam: a live-unresolved id gets a replacement.
+
+    ``s0`` has no ``missing_ids`` entry but failed the pass (unavailable
+    reply). Passing it as ``unresolved`` must yield one replacement, and that
+    replacement must not be the failed id itself.
+    """
+    corpus = [f"c{i}" for i in range(10)]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": cid} for cid in corpus]
+    )
+    gold_path = _write_jsonl(tmp_path / "gold.jsonl", [])
+    store = _make_store(tmp_path, corpus)
+    manifest = {"seed": 7, "missing_ids": [], "sampled_ids": ["c0", "c1"]}
+    replacements = sbr.backfill_ids(
+        manifest,
+        results=[],
+        unresolved=["c0"],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+        drop_ids=(),
+    )
+    assert len(replacements) == 1
+    assert replacements[0] not in {"c0", "c1"}
 
 
 def test_backfill_returns_empty_when_nothing_missing(tmp_path: Path) -> None:
@@ -622,7 +660,7 @@ def test_run_adjudication_reaches_min_rows() -> None:
         manifest,
         adjudicate=_adjudicator({}),
         append=lambda rec: True,
-        backfill=lambda m, r: [],
+        backfill=lambda m, r, u: [],
         min_rows=100,
     )
     assert report["n"] == 100
@@ -636,7 +674,7 @@ def test_run_adjudication_backfills_past_missing() -> None:
     # Backfill hands back two replacement ids that resolve fine.
     calls_seen = []
 
-    def backfill(m, rows):
+    def backfill(m, rows, unresolved):
         calls_seen.append(sorted(row["id"] for row in rows))
         return ["r0", "r1"]
 
@@ -667,7 +705,7 @@ def test_run_adjudication_skips_already_done_ids() -> None:
         results=done,
         adjudicate=adjudicate,
         append=lambda rec: True,
-        backfill=lambda m, r: [],
+        backfill=lambda m, r, u: [],
         min_rows=100,
     )
     assert adjudicated == ["s99"]
@@ -682,7 +720,7 @@ def test_run_adjudication_fails_loudly_when_backfill_dries_up() -> None:
             manifest,
             adjudicate=_adjudicator({}, missing={"s0", "s1", "s2"}),
             append=lambda rec: True,
-            backfill=lambda m, r: [],
+            backfill=lambda m, r, u: [],
             min_rows=100,
         )
     assert "3" in str(excinfo.value) or "0" in str(excinfo.value)
@@ -704,7 +742,7 @@ def test_run_adjudication_respects_append_guard() -> None:
         manifest,
         adjudicate=_adjudicator({}),
         append=append,
-        backfill=lambda m, r: [],
+        backfill=lambda m, r, u: [],
         min_rows=2,
     )
     assert report["n"] == 2
@@ -765,7 +803,7 @@ def test_determinism_run_adjudication_is_reproducible() -> None:
     """A seeded backfill makes the offline pass reproducible end to end."""
     manifest = {"seed": 11, "sampled_ids": ["s0", "s1", "s2"]}
 
-    def backfill(m, rows):
+    def backfill(m, rows, unresolved):
         return ["s3", "s4"]
 
     kwargs = dict(
@@ -1028,22 +1066,35 @@ def test_adjudicate_one_wraps_null_completion_as_unavailable() -> None:
 
 
 def test_run_adjudication_survives_unavailable_replies() -> None:
-    """An unavailable reply drops the id as unresolved instead of aborting."""
+    """An unavailable reply drops the id as unresolved and is backfilled.
+
+    F1 regression: the id that raised :class:`AdjudicationUnavailable` must
+    appear in the unresolved set handed to ``backfill``, so a replacement is
+    drawn and the adjudicated count still reaches ``min_rows``. Stubbing
+    backfill to ``[]`` hid this — the loop ended with the shortfall instead.
+    """
     manifest = {"seed": 3, "sampled_ids": ["s0", "s1", "s2"]}
+    seen_unresolved: list[list[str]] = []
 
     def adjudicate(rid):
         if rid == "s1":
             raise sbr.AdjudicationUnavailable(rid)
         return {"id": rid, "bin": "no-fault-within-round"}
 
+    def backfill(m, results, unresolved):
+        seen_unresolved.append(sorted(unresolved))
+        return ["r0"]
+
     report = sbr.run_adjudication(
         manifest,
         adjudicate=adjudicate,
         append=lambda rec: True,
-        backfill=lambda m, r: [],
-        min_rows=2,
+        backfill=backfill,
+        min_rows=3,
     )
-    assert report["n"] == 2
+    # The unavailable id was visible to backfill and replaced.
+    assert seen_unresolved == [["s1"]]
+    assert report["n"] == 3
     assert report["unresolved"] == ["s1"]
 
 
