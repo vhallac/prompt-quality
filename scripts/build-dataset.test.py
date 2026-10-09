@@ -416,6 +416,7 @@ def test_anchor_origin_sources_have_real_examples() -> None:
 # --- anchors against the real source (skipped if unreachable) ----------------
 
 
+@pytestmark_anchor
 def test_anchor_dedupe_248_to_244() -> None:
     raw_lines = sum(
         1
@@ -543,6 +544,34 @@ def test_redact_removes_secret_from_row_prompt() -> None:
     row = bd.row_for(rec)
     assert secret not in json.dumps(row)
     assert bd.REDACTION_PLACEHOLDER in row["prompt"]
+
+
+def test_redact_covers_all_free_text_fields() -> None:
+    """Every free-text field, not just ``prompt``, is redacted at emit.
+
+    S2 is an LLM summary of user content, so it can quote a credential; the
+    whole row must be scrubbed regardless of which field carries it.
+    """
+    or_secret = "sk-or-v1-" + "a" * 64
+    gh_secret = "ghp_" + "b" * 36
+    rec = _gold_record(
+        "e5" * 16,
+        "prompt-misread",
+        raw={
+            "s2": {
+                "root_cause": f"user pasted {or_secret} into the prompt",
+                "evidence": f"log line contained {gh_secret}",
+            }
+        },
+    )
+    rec.prompt = "ordinary prompt"
+    row = bd.row_for(rec)
+    blob = json.dumps(row)
+    assert or_secret not in blob and gh_secret not in blob
+    assert row["root_cause"] == (
+        f"user pasted {bd.REDACTION_PLACEHOLDER} into the prompt"
+    )
+    assert row["evidence"] == f"log line contained {bd.REDACTION_PLACEHOLDER}"
 
 
 def test_redaction_covers_all_patterns() -> None:

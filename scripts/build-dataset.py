@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Build the labelled prompt dataset for the prompt-quality experiment.
 
-unit-001 covers the core: load fault-pipeline records, dedupe by id (last
-write wins), drop the two Q2 ids, and derive the gold label split. unit-002
-adds prompt resolution (full ``userPrompt`` from the round store, with
-unresolved rows flagged and never substituted) and a run report.
-Origin back-propagation and artifact emission are later units.
+The pipeline: load fault-pipeline records, dedupe by id (last write wins),
+drop the two Q2 ids, and derive the gold label split; resolve the full
+``userPrompt`` from the round store (unresolved rows flagged, never
+substituted); back-propagate the origin from S2 text; and emit both artifacts
+deterministically (byte-identical re-run). Free-text fields are redacted at
+emit time so no artifact can ship a credential.
 
 Definitions (issue #1 / attack-plan.md E1):
   positive  : fault bins  -> prompt-misread, stale-context, other, retrieval-noise
@@ -449,8 +450,8 @@ def row_for(record: Record) -> dict:
         "origin_id": record.origin_id,
         "origin_source": record.origin_source,
         "fault_type": s2.get("fault_type"),
-        "root_cause": s2.get("root_cause"),
-        "evidence": s2.get("evidence"),
+        "root_cause": redact(s2.get("root_cause")),
+        "evidence": redact(s2.get("evidence")),
         "timestamp": record.raw.get("timestamp"),
         "s0_f": record.raw.get("s0_f"),
         "s0_filter_pass": record.raw.get("s0_filter_pass"),
