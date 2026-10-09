@@ -129,6 +129,16 @@ DEFAULT_LLM_MODEL = "z-ai/glm-5.3-flash"
 # S2 is the only stage this script runs (issue #2: no S0/S1 ranking).
 S2_STAGES = frozenset({"S2"})
 
+# Bin classification (issue #2: reuses C1's fault definition).
+POSITIVE_BINS = frozenset(
+    {"prompt-misread", "stale-context", "other", "retrieval-noise"}
+)
+NEGATIVE_BINS = frozenset({"no-fault-within-round", "external"})
+EXCLUDED_BINS = frozenset({"ambiguous"})
+
+# Minimum adjudicated rows before a CI may be reported (issue #2 extension 6a).
+MIN_ROWS = 100
+
 
 # --- I/O helpers -------------------------------------------------------------
 
@@ -444,6 +454,201 @@ def append_result(record: dict, path: str | Path = DEFAULT_RESULTS) -> bool:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     return True
+
+
+# --- Run report + backfill ---------------------------------------------------
+
+
+def classify_bin(bin_name: str) -> str:
+    """Map a bin name to ``positive`` | ``negative`` | ``excluded``.
+
+    Reuses C1's fault definition (issue #2): fault-type bins are positive;
+    ``no-fault-within-round`` and ``external`` are negative; ``ambiguous`` is
+    excluded from the denominator. An unknown bin is treated as ``ambiguous``
+    rather than silently counted, so vocabulary drift surfaces instead of
+    skewing the rate.
+    """
+    if bin_name in POSITIVE_BINS:
+        return "positive"
+    if bin_name in NEGATIVE_BINS:
+        return "negative"
+    return "excluded"
+
+
+def wilson_interval(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion.
+
+    Wilson rather than Wald (issue #2): better small-``n`` coverage, and it
+    stays inside [0, 1] for a zero count. ``Z`` defaults to the 95% normal
+    quantile. ``n == 0`` has no estimable rate, so it is rejected.
+    """
+    if n <= 0:
+        raise ValueError("wilson_interval needs n > 0")
+    if not 0 <= k <= n:
+        raise ValueError(f"k={k} out of range for n={n}")
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = (z / denom) * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    low, high = centre - margin, centre + margin
+    # At a boundary proportion the exact Wilson endpoint is 0 or 1; the formula
+    # lands a few ulps short, so pin it to keep n=0/k=n reports clean.
+    if k == 0:
+        low = 0.0
+    if k == n:
+        high = 1.0
+    return (max(0.0, low), min(1.0, high))
+
+
+def summarize(rows: Iterable[dict], unresolved: Iterable[str] = ()) -> dict:
+    """Tally adjudicated rows into the run report's counts and rate.
+
+    ``bin`` is read from the record; a record without one is tallied under
+    ``ambiguous`` (the pipeline's own fallback), never dropped. The fault rate
+    is ``k / (positive + negative)`` — ``ambiguous`` is excluded from the
+    denominator, per C1's rule.
+    """
+    bin_counts: dict[str, int] = {}
+    class_counts = {"positive": 0, "negative": 0, "excluded": 0}
+    for row in rows:
+        bin_name = row.get("bin") or "ambiguous"
+        bin_counts[bin_name] = bin_counts.get(bin_name, 0) + 1
+        class_counts[classify_bin(bin_name)] += 1
+
+    n = class_counts["positive"] + class_counts["negative"]
+    k = class_counts["positive"]
+    low, high = wilson_interval(k, n) if n > 0 else (0.0, 0.0)
+    return {
+        "n": sum(bin_counts.values()),
+        "denominator": n,
+        "k": k,
+        "fault_rate": (k / n) if n > 0 else 0.0,
+        "ci_low": low,
+        "ci_high": high,
+        "bins": dict(sorted(bin_counts.items())),
+        "positive": class_counts["positive"],
+        "negative": class_counts["negative"],
+        "ambiguous": bin_counts.get("ambiguous", 0),
+        "excluded": class_counts["excluded"],
+        "external": bin_counts.get("external", 0),
+        "unresolved": sorted(unresolved),
+    }
+
+
+def build_report(
+    rows: Iterable[dict],
+    manifest: dict | None = None,
+    unresolved: Iterable[str] = (),
+    min_rows: int = MIN_ROWS,
+) -> dict:
+    """Assemble the run report, failing loudly on a shortfall.
+
+    Issue #2 extension 6a: fewer than ``min_rows`` adjudicated rows must abort
+    with the shortfall and the unresolved list, never a CI over too few rows.
+    The report also carries the frame arithmetic so the number is auditable.
+    """
+    rows = list(rows)
+    report = summarize(rows, unresolved)
+    if report["n"] < min_rows:
+        raise SystemExit(
+            f"shortfall: adjudicated {report['n']} rows, need {min_rows}; "
+            f"unresolved={report['unresolved']}"
+        )
+    if manifest is not None:
+        report["frame"] = {
+            "corpus_size": manifest.get("corpus_size"),
+            "gold_size": manifest.get("gold_size"),
+            "missing_size": manifest.get("missing_size"),
+            "frame_size": manifest.get("frame_size"),
+            "sample_size": manifest.get("sample_size"),
+            "seed": manifest.get("seed"),
+        }
+    return report
+
+
+def backfill_ids(
+    manifest: dict,
+    results: Iterable[dict],
+    corpus_path: str | Path = DEFAULT_CORPUS,
+    gold_path: str | Path = DEFAULT_GOLD,
+    round_store: str | Path = DEFAULT_ROUND_STORE,
+    drop_ids: Iterable[str] = DROP_IDS,
+) -> list[str]:
+    """Draw replacement ids for sampled ids that have no round file.
+
+    Issue #2 extension 1a: an unresolvable sampled id is dropped and replaced
+    by the next eligible id, so the adjudicated count still reaches 100. The
+    replacements come from the full eligible frame (a superset of the sample)
+    and exclude every id already sampled, adjudicated, or drawn as a
+    replacement, so no id is used twice. Order is deterministic given the
+    manifest's seed.
+    """
+    missing = set(manifest.get("missing_ids", []))
+    sampled = manifest.get("sampled_ids", [])
+    unresolved = [rid for rid in sampled if rid in missing]
+    if not unresolved:
+        return []
+
+    corpus = corpus_ids(corpus_path)
+    gold = gold_ids(gold_path, drop_ids)
+    still_missing = missing_round_ids(corpus, round_store)
+    frame = eligible_frame(corpus, gold, still_missing)
+    used = set(sampled) | {row["id"] for row in results if row.get("id")}
+    pool = [rid for rid in frame if rid not in used]
+    if len(pool) < len(unresolved):
+        raise SystemExit(
+            f"cannot backfill {len(unresolved)} unresolved ids: pool has {len(pool)}"
+        )
+    return draw_sample(pool, len(unresolved), manifest.get("seed", DEFAULT_SEED))
+
+
+def run_adjudication(
+    manifest: dict,
+    results: Iterable[dict] = (),
+    adjudicate: Callable[[str], dict] | None = None,
+    append: Callable[[dict], bool] | None = None,
+    backfill: Callable[[dict, Iterable[dict]], list[str]] | None = None,
+    min_rows: int = MIN_ROWS,
+    max_rounds: int = 5,
+) -> dict:
+    """Drive adjudication over the manifest, backfilling to reach ``min_rows``.
+
+    Walks the resume plan (manifest minus already-done ids), adjudicates each
+    id, and appends the result. Ids whose round file is missing are dropped and
+    replaced by drawing from the remaining eligible pool, repeating until the
+    adjudicated count reaches ``min_rows`` or the backfill pool dries up
+    (issue #2 extension 1a). Returns the final run report.
+
+    ``adjudicate``, ``append``, and ``backfill`` are injectable so the loop is
+    exercised fully offline; the defaults wire the real S2 adapter, transcript,
+    and frame arithmetic.
+    """
+    adjudicate = adjudicate or (lambda rid: adjudicate_one(rid))
+    append = append or append_result
+    backfill = backfill or backfill_ids
+
+    all_results = list(results)
+    unresolved: list[str] = []
+    todo = resume_plan(manifest, all_results)
+    for _ in range(max_rounds):
+        for rid in todo:
+            try:
+                record = adjudicate(rid)
+            except FileNotFoundError:
+                unresolved.append(rid)
+                continue
+            if append(record):
+                all_results.append(record)
+
+        done = {row["id"] for row in all_results}
+        if len(done) >= min_rows:
+            break
+        replacements = backfill(manifest, all_results)
+        todo = [rid for rid in replacements if rid not in done]
+        if not todo:
+            break
+
+    return build_report(all_results, manifest=manifest, unresolved=unresolved, min_rows=min_rows)
 
 
 # --- CLI ---------------------------------------------------------------------

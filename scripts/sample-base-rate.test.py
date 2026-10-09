@@ -368,3 +368,344 @@ def test_real_frame_anchor() -> None:
     assert manifest["gold_size"] == sbr.EXPECTED_GOLD
     assert manifest["missing_size"] == 29
     assert manifest["frame_size"] == sbr.EXPECTED_FRAME
+
+
+# --- unit-003: run report + backfill -----------------------------------------
+
+
+def test_classify_bin_positive_set() -> None:
+    for name in ("prompt-misread", "stale-context", "other", "retrieval-noise"):
+        assert sbr.classify_bin(name) == "positive"
+
+
+def test_classify_bin_negative_set() -> None:
+    assert sbr.classify_bin("no-fault-within-round") == "negative"
+    assert sbr.classify_bin("external") == "negative"
+
+
+def test_classify_bin_excludes_ambiguous() -> None:
+    assert sbr.classify_bin("ambiguous") == "excluded"
+
+
+def test_classify_bin_unknown_is_excluded() -> None:
+    # An unknown bin must not be silently counted as a fault.
+    assert sbr.classify_bin("some-new-bin") == "excluded"
+
+
+def test_bin_vocabulary_matches_c1_gold() -> None:
+    """The report's positive/negative/excluded rule mirrors C1's gold bins."""
+    if not sbr.DEFAULT_GOLD.exists():
+        pytest.skip("committed gold artifact not present")
+    vocabulary = {row["bin"] for row in sbr.read_jsonl(sbr.DEFAULT_GOLD)}
+    assert vocabulary <= (
+        sbr.POSITIVE_BINS | sbr.NEGATIVE_BINS | sbr.EXCLUDED_BINS
+    ), f"gold carries bins the report does not classify: {vocabulary}"
+
+
+def test_wilson_interval_brackets_point_estimate() -> None:
+    low, high = sbr.wilson_interval(29, 100)
+    assert low < 0.29 < high
+
+
+def test_wilson_interval_matches_issue_anchor() -> None:
+    """At n=100, p=0.29 the 95% interval is ≈ ±9 pp (issue #2)."""
+    low, high = sbr.wilson_interval(29, 100)
+    assert abs((high - low) / 2) == pytest.approx(0.088, abs=0.006)
+
+
+def test_wilson_interval_stays_in_unit_range_at_zero() -> None:
+    low, high = sbr.wilson_interval(0, 100)
+    assert low == 0.0 and 0.0 < high < 0.1
+
+
+def test_wilson_interval_stays_in_unit_range_at_full() -> None:
+    low, high = sbr.wilson_interval(100, 100)
+    assert 0.9 < low < 1.0 and high == 1.0
+
+
+def test_wilson_interval_narrows_with_n() -> None:
+    narrow = sbr.wilson_interval(290, 1000)
+    wide = sbr.wilson_interval(29, 100)
+    assert (narrow[1] - narrow[0]) < (wide[1] - wide[0])
+
+
+def test_wilson_interval_rejects_empty_n() -> None:
+    with pytest.raises(ValueError):
+        sbr.wilson_interval(0, 0)
+
+
+def test_wilson_interval_rejects_out_of_range_k() -> None:
+    with pytest.raises(ValueError):
+        sbr.wilson_interval(11, 10)
+
+
+def test_summarize_excludes_ambiguous_from_denominator() -> None:
+    rows = [
+        {"id": "a", "bin": "prompt-misread"},
+        {"id": "b", "bin": "no-fault-within-round"},
+        {"id": "c", "bin": "ambiguous"},
+    ]
+    report = sbr.summarize(rows)
+    assert report["n"] == 3
+    assert report["denominator"] == 2
+    assert report["k"] == 1
+    assert report["fault_rate"] == pytest.approx(0.5)
+    assert report["ambiguous"] == 1
+
+
+def test_summarize_counts_external_as_negative() -> None:
+    rows = [
+        {"id": "a", "bin": "external"},
+        {"id": "b", "bin": "stale-context"},
+    ]
+    report = sbr.summarize(rows)
+    assert report["external"] == 1
+    assert report["denominator"] == 2
+    assert report["k"] == 1
+
+
+def test_summarize_tallies_each_bin_name() -> None:
+    rows = [
+        {"id": "a", "bin": "prompt-misread"},
+        {"id": "b", "bin": "prompt-misread"},
+        {"id": "c", "bin": "other"},
+    ]
+    report = sbr.summarize(rows)
+    assert report["bins"] == {"other": 1, "prompt-misread": 2}
+    assert report["positive"] == 3
+
+
+def test_summarize_treats_missing_bin_as_ambiguous() -> None:
+    report = sbr.summarize([{"id": "a"}])
+    assert report["ambiguous"] == 1
+    assert report["denominator"] == 0
+    assert report["fault_rate"] == 0.0
+
+
+def test_summarize_records_unresolved_sorted() -> None:
+    report = sbr.summarize([], unresolved=["z", "a"])
+    assert report["unresolved"] == ["a", "z"]
+
+
+def test_build_report_fails_loudly_below_min_rows() -> None:
+    rows = [{"id": str(i), "bin": "no-fault-within-round"} for i in range(3)]
+    with pytest.raises(SystemExit) as excinfo:
+        sbr.build_report(rows, unresolved=["gone"], min_rows=100)
+    message = str(excinfo.value)
+    assert "3" in message and "100" in message and "gone" in message
+
+
+def test_build_report_passes_at_min_rows() -> None:
+    rows = [{"id": str(i), "bin": "prompt-misread"} for i in range(100)]
+    report = sbr.build_report(rows, min_rows=100)
+    assert report["n"] == 100
+    assert report["k"] == 100
+
+
+def test_build_report_carries_frame_arithmetic() -> None:
+    manifest = {
+        "corpus_size": 5430,
+        "gold_size": 244,
+        "missing_size": 29,
+        "frame_size": 5159,
+        "sample_size": 100,
+        "seed": 20261009,
+    }
+    rows = [{"id": str(i), "bin": "no-fault-within-round"} for i in range(100)]
+    report = sbr.build_report(rows, manifest=manifest, min_rows=100)
+    assert report["frame"]["frame_size"] == 5159
+    assert report["frame"]["seed"] == 20261009
+
+
+def test_backfill_replaces_unresolved_ids(tmp_path: Path) -> None:
+    corpus = [f"c{i}" for i in range(10)]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": cid} for cid in corpus]
+    )
+    gold_path = _write_jsonl(tmp_path / "gold.jsonl", [])
+    store = _make_store(tmp_path, corpus)  # every id has a file
+    manifest = {
+        "seed": 7,
+        "missing_ids": ["c1", "c2"],
+        "sampled_ids": ["c0", "c1", "c2"],
+    }
+    replacements = sbr.backfill_ids(
+        manifest,
+        results=[],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+        drop_ids=(),
+    )
+    assert len(replacements) == 2
+    # Replacements are drawn from the frame, not from the dropped ids.
+    assert set(replacements).isdisjoint({"c1", "c2"})
+    assert set(replacements) <= set(corpus)
+
+
+def test_backfill_returns_empty_when_nothing_missing(tmp_path: Path) -> None:
+    corpus = ["c0", "c1"]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": cid} for cid in corpus]
+    )
+    gold_path = _write_jsonl(tmp_path / "gold.jsonl", [])
+    store = _make_store(tmp_path, corpus)
+    manifest = {"seed": 7, "missing_ids": [], "sampled_ids": ["c0"]}
+    assert (
+        sbr.backfill_ids(
+            manifest,
+            results=[],
+            corpus_path=corpus_path,
+            gold_path=gold_path,
+            round_store=store,
+            drop_ids=(),
+        )
+        == []
+    )
+
+
+def test_backfill_excludes_already_adjudicated_ids(tmp_path: Path) -> None:
+    corpus = [f"c{i}" for i in range(10)]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": cid} for cid in corpus]
+    )
+    gold_path = _write_jsonl(tmp_path / "gold.jsonl", [])
+    store = _make_store(tmp_path, corpus)
+    manifest = {"seed": 7, "missing_ids": ["c1"], "sampled_ids": ["c0", "c1"]}
+    results = [{"id": f"c{i}"} for i in range(2, 9)]
+    replacements = sbr.backfill_ids(
+        manifest,
+        results=results,
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+        drop_ids=(),
+    )
+    assert replacements == ["c9"]
+
+
+def test_backfill_is_deterministic(tmp_path: Path) -> None:
+    corpus = [f"c{i}" for i in range(20)]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": cid} for cid in corpus]
+    )
+    gold_path = _write_jsonl(tmp_path / "gold.jsonl", [])
+    store = _make_store(tmp_path, corpus)
+    manifest = {"seed": 7, "missing_ids": ["c1"], "sampled_ids": ["c0", "c1"]}
+    kwargs = dict(
+        results=[],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+        drop_ids=(),
+    )
+    assert sbr.backfill_ids(manifest, **kwargs) == sbr.backfill_ids(manifest, **kwargs)
+
+
+def _adjudicator(verdicts: dict[str, dict], missing: set[str] | None = None):
+    """An offline adjudicator: canned bins, and a missing-round failure mode."""
+    missing = missing or set()
+
+    def adjudicate(rid: str) -> dict:
+        if rid in missing:
+            raise FileNotFoundError(rid)
+        # ``bin`` is the derived label (hyphenated), as ``bin_for`` produces.
+        body = verdicts.get(rid, {"verdict": "no_fault_within_round"})
+        return {"id": rid, "s2": body, "bin": body.get("bin", "no-fault-within-round")}
+
+    return adjudicate
+
+
+def test_run_adjudication_reaches_min_rows() -> None:
+    manifest = {"seed": 7, "sampled_ids": [f"s{i}" for i in range(100)]}
+    report = sbr.run_adjudication(
+        manifest,
+        adjudicate=_adjudicator({}),
+        append=lambda rec: True,
+        backfill=lambda m, r: [],
+        min_rows=100,
+    )
+    assert report["n"] == 100
+    assert report["denominator"] == 100
+    assert report["k"] == 0
+
+
+def test_run_adjudication_backfills_past_missing() -> None:
+    manifest = {"seed": 7, "sampled_ids": [f"s{i}" for i in range(100)]}
+    missing = {"s0", "s1"}
+    # Backfill hands back two replacement ids that resolve fine.
+    calls_seen = []
+
+    def backfill(m, rows):
+        calls_seen.append(sorted(row["id"] for row in rows))
+        return ["r0", "r1"]
+
+    report = sbr.run_adjudication(
+        manifest,
+        adjudicate=_adjudicator({}, missing=missing),
+        append=lambda rec: True,
+        backfill=backfill,
+        min_rows=100,
+    )
+    assert report["n"] == 100
+    assert report["unresolved"] == ["s0", "s1"]
+    # Backfill ran once, seeing the 98 survivors that the first pass appended.
+    assert calls_seen == [sorted(f"s{i}" for i in range(2, 100))]
+
+
+def test_run_adjudication_skips_already_done_ids() -> None:
+    manifest = {"seed": 7, "sampled_ids": [f"s{i}" for i in range(100)]}
+    done = [{"id": f"s{i}", "bin": "no-fault-within-round"} for i in range(99)]
+    adjudicated = []
+
+    def adjudicate(rid):
+        adjudicated.append(rid)
+        return {"id": rid, "bin": "prompt-misread"}
+
+    report = sbr.run_adjudication(
+        manifest,
+        results=done,
+        adjudicate=adjudicate,
+        append=lambda rec: True,
+        backfill=lambda m, r: [],
+        min_rows=100,
+    )
+    assert adjudicated == ["s99"]
+    assert report["n"] == 100
+    assert report["k"] == 1
+
+
+def test_run_adjudication_fails_loudly_when_backfill_dries_up() -> None:
+    manifest = {"seed": 7, "sampled_ids": [f"s{i}" for i in range(3)]}
+    with pytest.raises(SystemExit) as excinfo:
+        sbr.run_adjudication(
+            manifest,
+            adjudicate=_adjudicator({}, missing={"s0", "s1", "s2"}),
+            append=lambda rec: True,
+            backfill=lambda m, r: [],
+            min_rows=100,
+        )
+    assert "3" in str(excinfo.value) or "0" in str(excinfo.value)
+    assert "100" in str(excinfo.value)
+
+
+def test_run_adjudication_respects_append_guard() -> None:
+    """A rejected append (duplicate id) must not inflate the count."""
+    manifest = {"seed": 7, "sampled_ids": ["s0", "s1"]}
+    appended = []
+
+    def append(rec):
+        if rec["id"] in appended:
+            return False
+        appended.append(rec["id"])
+        return True
+
+    report = sbr.run_adjudication(
+        manifest,
+        adjudicate=_adjudicator({}),
+        append=append,
+        backfill=lambda m, r: [],
+        min_rows=2,
+    )
+    assert report["n"] == 2
+    assert appended == ["s0", "s1"]
