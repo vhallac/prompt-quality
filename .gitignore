@@ -9,3 +9,6 @@ __pycache__/
 
 # Local scratch
 .tmp/
+
+# Run caches and logs (LLM response cache, pass logs)
+.cache/
