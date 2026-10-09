@@ -709,3 +709,186 @@ def test_run_adjudication_respects_append_guard() -> None:
     )
     assert report["n"] == 2
     assert appended == ["s0", "s1"]
+
+
+# --- unit-004: determinism + frame/gold cross-check --------------------------
+
+
+def _gold_bin_counts() -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in sbr.read_jsonl(sbr.DEFAULT_GOLD):
+        counts[row["bin"]] = counts.get(row["bin"], 0) + 1
+    return counts
+
+
+def test_determinism_manifest_rerun_is_byte_identical(tmp_path: Path) -> None:
+    """Same seed + same inputs ⇒ byte-identical manifest, twice over."""
+    corpus = [f"id{i:03d}" for i in range(60)]
+    _write_jsonl(tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus])
+    _write_jsonl(tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:5]])
+    store = _make_store(tmp_path, corpus[5:])
+    kwargs = dict(
+        seed=4242,
+        sample_size=25,
+        corpus_path=tmp_path / "corpus.jsonl",
+        gold_path=tmp_path / "gold.jsonl",
+        round_store=store,
+        drop_ids=set(),
+    )
+    a = sbr.build_manifest(**kwargs)
+    b = sbr.build_manifest(**kwargs)
+    assert a == b
+    pa = sbr.write_manifest(a, tmp_path / "a.json")
+    pb = sbr.write_manifest(b, tmp_path / "b.json")
+    assert pa.read_bytes() == pb.read_bytes()
+
+
+def test_determinism_different_seed_changes_manifest(tmp_path: Path) -> None:
+    """Control: a different seed must actually move the draw."""
+    corpus = [f"id{i:03d}" for i in range(60)]
+    _write_jsonl(tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus])
+    _write_jsonl(tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:5]])
+    store = _make_store(tmp_path, corpus[5:])
+    base = dict(
+        sample_size=25,
+        corpus_path=tmp_path / "corpus.jsonl",
+        gold_path=tmp_path / "gold.jsonl",
+        round_store=store,
+        drop_ids=set(),
+    )
+    a = sbr.build_manifest(seed=1, **base)
+    b = sbr.build_manifest(seed=2, **base)
+    assert a["sampled_ids"] != b["sampled_ids"]
+
+
+def test_determinism_run_adjudication_is_reproducible() -> None:
+    """A seeded backfill makes the offline pass reproducible end to end."""
+    manifest = {"seed": 11, "sampled_ids": ["s0", "s1", "s2"]}
+
+    def backfill(m, rows):
+        return ["s3", "s4"]
+
+    kwargs = dict(
+        adjudicate=_adjudicator({}, missing={"s2"}),
+        append=lambda rec: True,
+        backfill=backfill,
+        min_rows=4,
+    )
+    report_a = sbr.run_adjudication(manifest, **kwargs)
+    report_b = sbr.run_adjudication(manifest, **kwargs)
+    assert report_a == report_b
+
+
+def test_determinism_committed_manifest_reproduces_from_seed() -> None:
+    """The committed manifest is byte-reproducible from its recorded seed.
+
+    This is the determinism obligation anchored on a committed artifact: the
+    frame+sample step re-run over the live inputs must yield the ids already
+    recorded, otherwise the seed no longer explains the sample.
+    """
+    if not sbr.DEFAULT_CORPUS.exists() or not sbr.DEFAULT_GOLD.exists():
+        pytest.skip("committed corpus/gold artifacts not present")
+    if not sbr.DEFAULT_MANIFEST.exists():
+        pytest.skip("committed sample manifest not present")
+    if not sbr.DEFAULT_ROUND_STORE.exists():
+        pytest.skip("round store not present")
+    committed = json.loads(sbr.DEFAULT_MANIFEST.read_text(encoding="utf-8"))
+    rerun = sbr.build_manifest(
+        seed=committed["seed"],
+        sample_size=committed["sample_size"],
+    )
+    assert rerun["sampled_ids"] == committed["sampled_ids"]
+    assert rerun["missing_ids"] == committed["missing_ids"]
+    assert rerun["frame_size"] == committed["frame_size"]
+
+
+def test_cross_check_frame_arithmetic_matches_fresh_computation(tmp_path: Path) -> None:
+    """The manifest's recorded arithmetic equals a fresh eligible-frame pass."""
+    corpus = [f"id{i:03d}" for i in range(50)]
+    _write_jsonl(tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus])
+    _write_jsonl(tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:4]])
+    # Gold ids are known rounds: their files exist. The exact subtraction
+    # |corpus| - |gold| - |missing| holds only when gold and missing are
+    # disjoint, which is the real-world invariant.
+    store = _make_store(tmp_path, corpus)
+    manifest = sbr.build_manifest(
+        sample_size=10,
+        corpus_path=tmp_path / "corpus.jsonl",
+        gold_path=tmp_path / "gold.jsonl",
+        round_store=store,
+        drop_ids=set(),
+    )
+    gold = {row["id"] for row in sbr.read_jsonl(tmp_path / "gold.jsonl")}
+    missing = set(manifest["missing_ids"])
+    fresh = sbr.eligible_frame(corpus, gold, missing)
+    assert manifest["frame_size"] == len(fresh)
+    assert manifest["corpus_size"] - manifest["gold_size"] - manifest["missing_size"] == len(fresh)
+
+
+def test_cross_check_sample_ids_avoid_gold_and_missing(tmp_path: Path) -> None:
+    """No sampled id may come from the excluded gold or missing sets."""
+    corpus = [f"id{i:03d}" for i in range(60)]
+    _write_jsonl(tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus])
+    _write_jsonl(tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:5]])
+    store = _make_store(tmp_path, corpus[5:])
+    manifest = sbr.build_manifest(
+        sample_size=20,
+        corpus_path=tmp_path / "corpus.jsonl",
+        gold_path=tmp_path / "gold.jsonl",
+        round_store=store,
+        drop_ids=set(),
+    )
+    sampled = set(manifest["sampled_ids"])
+    assert sampled.isdisjoint(corpus[:5])
+    assert sampled.isdisjoint(manifest["missing_ids"])
+    assert len(sampled) == manifest["sample_size"]
+
+
+def test_cross_check_gold_split_reconciles_with_c1() -> None:
+    """C1's published split: 242 rows = 29 positive + 205 negative + 8 excluded."""
+    if not sbr.DEFAULT_GOLD.exists():
+        pytest.skip("committed gold artifact not present")
+    counts = _gold_bin_counts()
+    positive = sum(n for b, n in counts.items() if sbr.classify_bin(b) == "positive")
+    negative = sum(n for b, n in counts.items() if sbr.classify_bin(b) == "negative")
+    excluded = sum(n for b, n in counts.items() if sbr.classify_bin(b) == "excluded")
+    assert positive == 29
+    assert negative == 205
+    assert excluded == 8
+    assert positive + negative + excluded == 242
+
+
+def test_cross_check_gold_ids_size_matches_issue_anchor() -> None:
+    """The 244 deduped gold ids = 242 labelled rows + 2 C1-dropped ids."""
+    if not sbr.DEFAULT_GOLD.exists():
+        pytest.skip("committed gold artifact not present")
+    labelled = {row["id"] for row in sbr.read_jsonl(sbr.DEFAULT_GOLD)}
+    assert len(labelled) == 242
+    gold = sbr.gold_ids()
+    assert len(gold) == sbr.EXPECTED_GOLD == 244
+    assert gold == labelled | set(sbr.DROP_IDS)
+
+
+def test_cross_check_gold_never_reaches_the_frame(tmp_path: Path) -> None:
+    """Gold ids are excluded from the frame by construction (drift detector)."""
+    corpus = [f"id{i:03d}" for i in range(30)]
+    _write_jsonl(tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus])
+    _write_jsonl(
+        tmp_path / "gold.jsonl",
+        [{"id": rid, "bin": "ambiguous"} for rid in corpus[:3]],
+    )
+    # Gold ids are known rounds; their files exist, so they leave the frame by
+    # construction and never re-appear as "missing".
+    store = _make_store(tmp_path, corpus)
+    manifest = sbr.build_manifest(
+        sample_size=5,
+        corpus_path=tmp_path / "corpus.jsonl",
+        gold_path=tmp_path / "gold.jsonl",
+        round_store=store,
+        drop_ids=set(),
+    )
+    # Gold stays out of the frame, and the subtraction stays exact because
+    # gold and missing are disjoint (the round files for gold ids exist).
+    assert set(manifest["sampled_ids"]).isdisjoint(corpus[:3])
+    assert set(manifest["missing_ids"]).isdisjoint(corpus[:3])
+    assert manifest["frame_size"] == len(corpus) - manifest["gold_size"]
