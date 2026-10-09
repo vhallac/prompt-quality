@@ -336,10 +336,9 @@ FEATURE_NAMES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Logistic combiner (zero-dependency, fixed seed)
+# Logistic combiner (zero-dependency, deterministic)
 # ---------------------------------------------------------------------------
 
-LOGISTIC_SEED = 20260109
 LOGISTIC_EPOCHS = 2000
 LOGISTIC_LR = 0.1
 LOGISTIC_L2 = 1e-3
@@ -351,12 +350,11 @@ def fit_logistic(
     epochs: int = LOGISTIC_EPOCHS,
     lr: float = LOGISTIC_LR,
     l2: float = LOGISTIC_L2,
-    seed: int = LOGISTIC_SEED,
 ) -> list[float]:
     """Plain gradient descent on L2-regularised logistic loss.
 
-    Deterministic: weights init to zeros, fixed epoch/lr; the seed is
-    recorded for provenance but the fit does not sample.
+    Fully deterministic: weights init to zeros and the fit never samples, so
+    there is no seed to pass. Only the bootstrap CIs are seed-sensitive.
     Returns [w0, w1..wd] (bias first).
     """
     d = len(X[0])
@@ -901,9 +899,16 @@ def paired_auc_delta(
 def _feature_definitions() -> dict:
     """The feature definitions printed into the metrics file (extension 3a)."""
     return {
+        "ext_3a_scope": (
+            "'An ambiguous feature that matches nothing scores 0' applies to the "
+            "count/ratio features only: length, imperative_density, deixis. "
+            "output_contract_absence is an absence indicator, so a prompt that "
+            "matches none of its markers scores 1."
+        ),
         "length": {
             "description": "whitespace-token count of the prompt (chars also recorded)",
             "units": "tokens",
+            "empty_prompt_score": 0.0,
         },
         "imperative_density": {
             "description": "fraction of clauses whose first token is an imperative verb",
@@ -922,7 +927,7 @@ def _feature_definitions() -> dict:
             ),
             "format_words": sorted(FORMAT_WORDS),
             "contract_phrases": list(CONTRACT_PHRASES),
-            "unmatched_prompt_score": 0.0,
+            "no_marker_score": 1.0,
         },
     }
 

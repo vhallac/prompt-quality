@@ -1,6 +1,7 @@
 """C3 baseline tests: metrics core + gold loader + lexical baselines."""
 
 import importlib.util
+import inspect
 import json
 import math
 import sys
@@ -296,6 +297,13 @@ class TestLogisticCombiner:
         s = [logistic_score(w1, x) for x in X]
         # positives rank high
         assert auc(s, y) == 1.0
+
+    def test_fit_logistic_is_not_seed_sensitive(self):
+        # The fit never samples, so it must not expose a seed: a published
+        # seed on the combiner would present the weights as seed-re-drawable.
+        params = inspect.signature(fit_logistic).parameters
+        assert "seed" not in params
+        assert not hasattr(_b, "LOGISTIC_SEED")
 
     def test_standardisation_zero_std_feature(self):
         # a constant feature must not blow up: std 0 -> published as 0, and its
@@ -611,6 +619,33 @@ class TestReporting:
             "jev_own_response",
             "jev_parent_response",
         } <= set(score_rows[0])
+
+    def test_feature_definitions_match_the_implementations(self):
+        """F6: every declared score is the value the function really returns.
+
+        Extension 3a's "an ambiguous feature that matches nothing scores 0" is
+        true of the count/ratio features and false of output_contract_absence,
+        which is an absence indicator. The block has to state the polarity the
+        code implements, not the polarity the extension implies.
+        """
+        defs = _b._feature_definitions()
+        assert set(defs) == {*FEATURE_NAMES, "ext_3a_scope"}
+        for name in ("length", "imperative_density", "deixis"):
+            declared = defs[name]["empty_prompt_score"]
+            assert declared == 0.0
+            assert lexical_features("")[name] == declared
+        no_marker = "think about it more"
+        assert output_contract_absence(no_marker) == 1.0
+        assert defs["output_contract_absence"]["no_marker_score"] == 1.0
+        assert (
+            lexical_features(no_marker)["output_contract_absence"]
+            == defs["output_contract_absence"]["no_marker_score"]
+        )
+        assert "unmatched_prompt_score" not in defs["output_contract_absence"]
+        scope = defs["ext_3a_scope"]
+        for name in ("length", "imperative_density", "deixis"):
+            assert name in scope
+        assert "scores 1" in scope
 
     def test_published_combiner_is_rederivable(self, tmp_path):
         """F1: the published combiner must be re-derivable, not just named.
