@@ -18,6 +18,7 @@ _spec.loader.exec_module(baselines)
 
 from baselines import (
     FEATURE_NAMES,
+    RESPONSE_MARKER,
     auc,
     base_rate_threshold,
     bootstrap_ci,
@@ -33,6 +34,15 @@ from baselines import (
     logistic_score,
     operating_points,
     output_contract_absence,
+    parent_response_state,
+    prompt_only_state,
+    jev_flag_score,
+    jev_cache_key,
+    load_jev_cache,
+    own_response_state,
+    query_jev,
+    rescore_rows,
+    save_jev_cache,
     sensitivity,
     specificity,
     youden_threshold,
@@ -287,3 +297,219 @@ class TestGoldBaselineEndToEnd:
         assert auc(scores, labels) == 0.5
         lex, _ = combined_lexical_scores(rows)
         assert len(lex) == len(rows)
+
+
+# ---------------------------------------------------------------------------
+# unit-003: jev re-score harness
+# ---------------------------------------------------------------------------
+
+import baselines as _b  # module handle for constants/seams
+
+
+def _gold_rows():
+    return [
+        {"id": "a" * 32, "label": "positive", "prompt": "Fix the failing test."},
+        {"id": "b" * 32, "label": "negative", "prompt": "interesting. look at it now."},
+    ]
+
+
+def _round_file(rid, prompt, resp_seq="assistant text", segments=None, parent_id=None):
+    data = {
+        "id": rid,
+        "userPrompt": prompt,
+        "responseSequence": resp_seq,
+        "responseSegments": segments if segments is not None else [
+            {"type": "text", "text": resp_seq},
+        ],
+        "parentId": parent_id,
+    }
+    return data
+
+
+def test_prompt_only_state_uses_constant_marker():
+    s1 = prompt_only_state("Fix the bug.")
+    s2 = prompt_only_state("Fix the bug very differently.")
+    assert s1 == "USER PROMPT:\nFix the bug.\n\nASSISTANT RESPONSE:\n[not shown]"
+    assert RESPONSE_MARKER in s1
+    # the state is a function of the prompt alone: different rounds with the
+    # same prompt but different responses produce the same state
+    own = own_response_state("Fix the bug.", _round_file("a" * 32, "Fix the bug.", "response A"))
+    assert own != prompt_only_state("Fix the bug.")
+    assert "response A" not in prompt_only_state("Fix the bug.")
+
+
+def test_own_response_state_matches_jev_round_scan_shape():
+    data = _round_file("a" * 32, "Fix the bug.", "the fix is here")
+    assert (
+        own_response_state("Fix the bug.", data)
+        == "USER PROMPT:\nFix the bug.\n\nASSISTANT RESPONSE:\nthe fix is here"
+    )
+    # string-typed responseSequence (the current store shape) is used verbatim
+    data_str = dict(data, responseSequence="plain string response")
+    assert own_response_state("q", data_str).endswith("plain string response")
+
+
+def test_parent_response_state_redacts_tool_calls():
+    parent = {
+        "responseSegments": [
+            {"type": "text", "text": "first text"},
+            {"type": "toolCall", "tool": "bash"},
+            {"type": "text", "text": "second text"},
+        ],
+    }
+    s = parent_response_state("Fix the bug.", parent)
+    assert s.startswith("USER PROMPT:\nFix the bug.\n\nPREVIOUS ROUND RESPONSE")
+    assert "first text" in s and "second text" in s
+    assert "[1 tool calls in the parent response were redacted]" in s
+
+
+def test_parent_response_state_truncates_to_state_chars():
+    parent = {"responseSegments": [{"type": "text", "text": "x" * 20000}]}
+    s = parent_response_state("prompt", parent)
+    assert len(s) == _b.JEV_STATE_CHARS
+
+
+def test_jev_flag_score_is_monotone_max():
+    assert jev_flag_score({"correction": {"noul": 0.2}, "frustration": {"score": 1.0}}) == 0.25
+    assert jev_flag_score({"correction": {"noul": 0.9}, "frustration": {"score": 1.0}}) == 0.9
+    # scan flag rule (fr>=3 or corr>=0.7) implies score >= 0.7
+    assert jev_flag_score({"correction": {"noul": 0.0}, "frustration": {"score": 3.0}}) >= 0.7
+    assert jev_flag_score({}) == 0.0
+
+
+def test_rescore_prompt_only_never_touches_round_store(tmp_path):
+    calls = []
+
+    def fake_query(state, api_key, questions=None):
+        calls.append(state)
+        return {"correction": {"noul": 0.8}, "frustration": {"score": 0.0}}
+
+    cache = {}
+    # empty round store: prompt-only still scores
+    recs = rescore_rows(_gold_rows(), "prompt_only", cache, "key",
+                        query_fn=fake_query, round_store=tmp_path)
+    assert len(calls) == 2
+    assert [r["score"] for r in recs] == [0.8, 0.8]
+    assert all(r["reason"] is None for r in recs)
+    # both states were cached
+    assert len(cache) == 2
+
+
+def test_rescore_cache_hit_avoids_api_and_roundtrips(tmp_path):
+    calls = []
+
+    def fake_query(state, api_key, questions=None):
+        calls.append(state)
+        return {"correction": {"noul": 0.6}, "frustration": {"score": 2.0}}
+
+    cache = {}
+    first = rescore_rows(_gold_rows(), "prompt_only", cache, "key",
+                         query_fn=fake_query, round_store=tmp_path)
+    assert len(calls) == 2
+    path = save_jev_cache(cache, tmp_path / "jev-cache.json")
+    loaded = load_jev_cache(path)
+    assert loaded == cache
+    second = rescore_rows(_gold_rows(), "prompt_only", loaded, "key",
+                          query_fn=fake_query, round_store=tmp_path)
+    assert len(calls) == 2  # no additional calls
+    assert [r["score"] for r in second] == [r["score"] for r in first]
+
+
+def test_rescore_retries_then_succeeds(tmp_path):
+    attempts = []
+
+    def flaky(state, api_key, questions=None):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise OSError("boom")
+        return {"correction": {"noul": 0.9}, "frustration": {"score": 0.0}}
+
+    recs = rescore_rows(_gold_rows()[:1], "prompt_only", {}, "key",
+                        query_fn=flaky, round_store=tmp_path)
+    assert len(attempts) == 3
+    assert recs[0]["score"] == 0.9
+
+
+def test_rescore_api_failure_yields_null_score(tmp_path):
+    attempts = []
+
+    def dead(state, api_key, questions=None):
+        attempts.append(1)
+        raise OSError("network down")
+
+    recs = rescore_rows(_gold_rows(), "prompt_only", {}, "key",
+                        query_fn=dead, round_store=tmp_path)
+    assert len(attempts) == 2 * _b.JEV_MAX_RETRIES
+    assert all(r["score"] is None and r["reason"] == "api_error" for r in recs)
+
+
+def test_rescore_own_response_missing_round_file(tmp_path):
+    recs = rescore_rows(_gold_rows(), "own_response", {}, "key",
+                        query_fn=lambda *a, **k: {}, round_store=tmp_path)
+    assert all(r["score"] is None and r["reason"] == "missing_round" for r in recs)
+
+
+def test_rescore_parent_response_missing_or_parentless(tmp_path):
+    rows = [
+        {"id": "p" * 32, "label": "negative", "prompt": "parentless prompt"},
+        {"id": "c" * 32, "label": "positive", "prompt": "child prompt"},
+    ]
+    store = tmp_path / "rounds"
+    store.mkdir()
+    # child points at a parent that does not exist
+    (store / ("c" * 32 + ".json")).write_text(json.dumps(
+        _round_file("c" * 32, "child prompt", parent_id="p" * 32 + ".json")))
+    recs = rescore_rows(rows, "parent_response", {}, "key",
+                        query_fn=lambda *a, **k: {"correction": {"noul": 0.5}},
+                        round_store=store)
+    by_id = {r["id"]: r for r in recs}
+    assert by_id["p" * 32]["reason"] == "missing_round"  # its own file is absent
+    assert by_id["c" * 32]["reason"] == "missing_parent"
+
+    # with the parent present it scores
+    (store / ("p" * 32 + ".json")).write_text(json.dumps(
+        _round_file("p" * 32, "parentless prompt", segments=[
+            {"type": "text", "text": "parent prose"},
+        ])))
+    recs = rescore_rows(rows, "parent_response", {}, "key",
+                        query_fn=lambda *a, **k: {"correction": {"noul": 0.5}},
+                        round_store=store)
+    by_id = {r["id"]: r for r in recs}
+    assert by_id["c" * 32]["score"] == 0.5
+    assert by_id["p" * 32]["reason"] == "missing_parent"  # empty parentId
+
+
+def test_rescore_unknown_variant_raises(tmp_path):
+    with pytest.raises(ValueError):
+        rescore_rows(_gold_rows(), "full_chain", {}, "key", round_store=tmp_path)
+
+
+def test_query_jev_parses_answers_and_rejects_bad_shape(monkeypatch):
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"answers": {"correction": {"noul": 1.0}}}).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: FakeResp())
+    out = query_jev("state", "key")
+    assert out == {"correction": {"noul": 1.0}}
+
+    class BadResp(FakeResp):
+        def read(self):
+            return json.dumps({"unexpected": True}).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: BadResp())
+    with pytest.raises(ValueError):
+        query_jev("state", "key")
+
+
+def test_jev_cache_key_is_stable_and_separates_states(tmp_path):
+    assert jev_cache_key("s1") == jev_cache_key("s1")
+    assert jev_cache_key("s1") != jev_cache_key("s2")
+    # model separates keys
+    assert jev_cache_key("s1", "m1") != jev_cache_key("s1", "m2")

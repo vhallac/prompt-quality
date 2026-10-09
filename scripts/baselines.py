@@ -7,11 +7,15 @@ bootstrap 95% CI. No numpy/scipy/sklearn.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import random
 import re
 from collections.abc import Callable, Sequence
+from pathlib import Path
+from urllib import error, request
 
 # ---------------------------------------------------------------------------
 # Metrics core
@@ -350,6 +354,275 @@ def fit_logistic(
 def logistic_score(weights: list[float], x: list[float]) -> float:
     """Raw logit — monotone in probability, so it is a valid AUC score."""
     return weights[0] + sum(wj * xj for wj, xj in zip(weights[1:], x))
+
+
+# ---------------------------------------------------------------------------
+# Baseline (c): jev re-score harness (unit-003)
+# ---------------------------------------------------------------------------
+
+JEV_MODEL = "typesafe/jev-1.13"
+JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
+JEV_STATE_CHARS = 12000  # jev-round-scan.py default --state-chars
+ROUND_STORE = Path(
+    os.environ.get(
+        "PROMPT_QUALITY_ROUND_STORE",
+        Path.home() / ".pi" / "agent" / "semblr" / "rounds",
+    )
+)
+JEV_CACHE_PATH = Path(
+    os.environ.get("PROMPT_QUALITY_JEV_CACHE", "dataset/jev-cache.json")
+)
+JEV_MAX_RETRIES = 3
+
+# Marker substituted into the assistant-response slot for the prompt-only
+# variant. The slot is held constant so the jev score is a function of the
+# prompt alone while the payload keeps the shape the rubric expects.
+RESPONSE_MARKER = "[not shown]"
+
+# The question set of jev-round-scan.py (verbatim: the old wording that
+# separated clean vs positive in the phase-1 probes).
+JEV_QUESTIONS = {
+    "frustration": {
+        "type": "score",
+        "instructions": (
+            "How much frustration, irritation, or annoyance does the user "
+            "express in this prompt? Consider complaints, exasperation, "
+            "sarcasm, urgency, or corrections delivered with heat. A calm "
+            "neutral request scores 0."
+        ),
+        "criteria": [
+            "Calm and neutral",
+            "Slightly impatient",
+            "Clearly annoyed",
+            "Frustrated or upset",
+            "Angry or at the end of their rope",
+        ],
+    },
+    "correction": {
+        "type": "noul",
+        "instructions": (
+            "Is the user correcting the assistant's failure to find, recall, "
+            "or surface a relevant past conversation round? Signals: the user "
+            "says 'you already did this', 'we discussed this before', 'you "
+            "forgot', 'search again', 'that's not what I asked', or points "
+            "out that the assistant lost/misremembered context from earlier "
+            "rounds. General corrections of code or answers do NOT count - "
+            "only corrections about failed recall/discovery of past rounds."
+        ),
+    },
+}
+
+
+def _own_response_text(round_data: dict) -> str:
+    """Own-response text as jev-round-scan.py's build_state extracts it
+    (responseSequence is a plain string in current round files, but the
+    segment-list shape is mirrored for older files)."""
+    seq = round_data.get("responseSequence")
+    if isinstance(seq, str):
+        return seq
+    response = ""
+    for seg in seq or []:
+        text = seg.get("text") if isinstance(seg, dict) else None
+        if text:
+            response += text + "\n"
+    return response
+
+
+def prompt_only_state(prompt: str) -> str:
+    """State with the assistant-response slot replaced by a constant marker."""
+    combined = f"USER PROMPT:\n{prompt}\n\nASSISTANT RESPONSE:\n{RESPONSE_MARKER}"
+    return combined[:JEV_STATE_CHARS]
+
+
+def own_response_state(prompt: str, round_data: dict) -> str:
+    """State identical in shape to jev-round-scan.py's build_state output
+    (the leak the scan pass already carries)."""
+    combined = (
+        f"USER PROMPT:\n{prompt}\n\n"
+        f"ASSISTANT RESPONSE:\n{_own_response_text(round_data)}"
+    )
+    return combined[:JEV_STATE_CHARS]
+
+
+def parent_response_state(prompt: str, parent_data: dict) -> str:
+    """State in the shape of jev-round-scan.py's build_refine_state: the
+    prompt plus the parent round's response with tool calls redacted."""
+    texts = []
+    n_tools = 0
+    for seg in parent_data.get("responseSegments") or []:
+        if seg.get("type") == "toolCall":
+            n_tools += 1
+        elif seg.get("type") == "text" and seg.get("text"):
+            texts.append(seg["text"])
+    redacted = "\n".join(texts)
+    if n_tools:
+        redacted += f"\n\n[{n_tools} tool calls in the parent response were redacted]"
+    combined = (
+        f"USER PROMPT:\n{prompt}\n\n"
+        f"PREVIOUS ROUND RESPONSE (tool calls redacted):\n{redacted}"
+    )
+    return combined[:JEV_STATE_CHARS]
+
+
+def jev_flag_score(answers: dict) -> float:
+    """Single jev score per round: max(correction_p, frustration/4).
+
+    Monotone in each component and consistent with the scan's OR-flag rule
+    (frustration >= 3.0 or correction >= 0.7 implies score >= 0.7); the
+    definition is printed into the metrics file by unit-004.
+    """
+    correction_p = float(answers.get("correction", {}).get("noul", 0.0))
+    frustration = float(answers.get("frustration", {}).get("score", 0.0))
+    return max(correction_p, frustration / 4.0)
+
+
+def query_jev(
+    state: str,
+    api_key: str,
+    questions: dict | None = None,
+    url: str = JEV_DECISIONS_URL,
+) -> dict:
+    """One decisions-API call, in the shape of jev-round-scan.py's
+    query_jev. Raises on network/HTTP errors or an unexpected response
+    shape (the caller applies the retry/exclusion policy)."""
+    payload = json.dumps(
+        {"model": JEV_MODEL, "state": state, "questions": questions or JEV_QUESTIONS}
+    ).encode()
+    req = request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with request.urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read())
+    answers = body.get("answers") or body.get("results") or {}
+    if not answers:
+        raise ValueError(f"unexpected response shape: {list(body.keys())}")
+    return answers
+
+
+def jev_cache_key(state: str, model: str = JEV_MODEL) -> str:
+    """Stable cache key for one jev request (sample-base-rate.py pattern)."""
+    h = hashlib.sha256()
+    for part in (state, model):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def load_jev_cache(path: str | Path = JEV_CACHE_PATH) -> dict[str, str]:
+    """Load a ``{cache_key: answers-json}`` cache (empty if absent)."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_jev_cache(cache: dict[str, str], path: str | Path = JEV_CACHE_PATH) -> Path:
+    """Persist the cache deterministically (sorted keys, trailing newline)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(cache, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def load_round(round_id: str, round_store: str | Path = ROUND_STORE) -> dict:
+    """Read one round file; raises FileNotFoundError when absent."""
+    return json.loads((Path(round_store) / f"{round_id}.json").read_text())
+
+
+def rescore_rows(
+    rows: list[dict],
+    variant: str,
+    cache: dict[str, str],
+    api_key: str | None = None,
+    query_fn: Callable[..., dict] = query_jev,
+    round_store: str | Path = ROUND_STORE,
+    questions: dict | None = None,
+) -> list[dict]:
+    """Re-score gold rows through jev in one of three variants.
+
+    Variants: 'prompt_only' (marker response), 'own_response' (the scan's
+    leak shape), 'parent_response' (the refine shape). API results are
+    cached on disk (keyed like sample-base-rate.py); a cache hit makes the
+    run offline and deterministic.
+
+    Failure policy (issue #3 extensions 4a/4b): a round whose API call
+    fails after JEV_MAX_RETRIES gets score null with reason 'api_error';
+    a missing round or parent file gets score null with reason
+    'missing_round' / 'missing_parent'. Nulls are excluded from the
+    baseline's denominator by the caller (unit-004) and listed in the run
+    report; parent-response nulls exclude from the session delta only.
+    """
+    if variant not in ("prompt_only", "own_response", "parent_response"):
+        raise ValueError(f"unknown rescore variant {variant!r}")
+    out: list[dict] = []
+    for row in rows:
+        rid = row["id"]
+        prompt = row["prompt"]
+        record = {
+            "id": rid,
+            "label": row["label"],
+            "variant": variant,
+            "score": None,
+            "correction": None,
+            "frustration": None,
+            "reason": None,
+        }
+        state: str | None = None
+        if variant == "prompt_only":
+            state = prompt_only_state(prompt)
+        else:
+            try:
+                data = load_round(rid, round_store)
+            except FileNotFoundError:
+                record["reason"] = "missing_round"
+                out.append(record)
+                continue
+            if variant == "own_response":
+                state = own_response_state(prompt, data)
+            else:
+                parent_id = (data.get("parentId") or "").removesuffix(".json")
+                if not parent_id:
+                    record["reason"] = "missing_parent"
+                    out.append(record)
+                    continue
+                try:
+                    parent = load_round(parent_id, round_store)
+                except FileNotFoundError:
+                    record["reason"] = "missing_parent"
+                    out.append(record)
+                    continue
+                state = parent_response_state(prompt, parent)
+        assert state is not None
+        key = jev_cache_key(state)
+        if key in cache:
+            answers = json.loads(cache[key])
+        else:
+            answers = None
+            for _ in range(JEV_MAX_RETRIES):
+                try:
+                    answers = query_fn(state, api_key, questions=questions)
+                    break
+                except (error.URLError, OSError, ValueError):
+                    continue
+            if answers is None:
+                record["reason"] = "api_error"
+                out.append(record)
+                continue
+            cache[key] = json.dumps(answers, sort_keys=True)
+        record["correction"] = float(answers.get("correction", {}).get("noul", 0.0))
+        record["frustration"] = float(answers.get("frustration", {}).get("score", 0.0))
+        record["score"] = jev_flag_score(answers)
+        out.append(record)
+    return out
 
 
 def combined_lexical_scores(rows: list[dict]) -> tuple[list[float], list[float]]:
