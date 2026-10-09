@@ -1,6 +1,8 @@
-"""Unit-001 tests: metrics core (AUC, FNR/operating points, bootstrap CI)."""
+"""C3 baseline tests: metrics core + gold loader + lexical baselines."""
 
 import importlib.util
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -15,11 +17,22 @@ sys.modules["baselines"] = baselines
 _spec.loader.exec_module(baselines)
 
 from baselines import (
+    FEATURE_NAMES,
     auc,
     base_rate_threshold,
     bootstrap_ci,
+    combined_lexical_scores,
+    constant_prevalence_scores,
+    deixis_density,
+    fit_logistic,
     fnr,
+    imperative_density,
+    length_feature,
+    lexical_features,
+    load_gold,
+    logistic_score,
     operating_points,
+    output_contract_absence,
     sensitivity,
     specificity,
     youden_threshold,
@@ -144,3 +157,133 @@ class TestMetricsBootstrapCi:
         assert ci is not None
         lo, hi = ci["ci95"]
         assert 0.0 <= lo <= ci["point"] <= hi <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# unit-002 — gold loader, baseline (a), baseline (b) lexical features
+# ---------------------------------------------------------------------------
+
+def _write_gold(tmp_path, pos=29, neg=205, exc=8):
+    rows = []
+    for i in range(pos):
+        rows.append({"id": f"p{i}", "label": "positive", "prompt": f"fix p{i}", "prompt_status": "resolved"})
+    for i in range(neg):
+        rows.append({"id": f"n{i}", "label": "negative", "prompt": f"hello n{i}", "prompt_status": "resolved"})
+    for i in range(exc):
+        rows.append({"id": f"e{i}", "label": "excluded", "prompt": "", "prompt_status": "resolved"})
+    path = tmp_path / "gold.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return str(path)
+
+
+class TestGoldLoader:
+    """Loader contract: split arithmetic, 'run C1 first', excluded dropped."""
+
+    def test_loader_split_and_excluded_dropped(self, tmp_path):
+        path = _write_gold(tmp_path)
+        rows, tally = load_gold(path)
+        assert len(rows) == 234 and tally == {"positive": 29, "negative": 205, "excluded": 8}
+        assert all(r["label"] in ("positive", "negative") for r in rows)
+
+    def test_loader_missing_file_run_c1_first(self, tmp_path):
+        with pytest.raises(RuntimeError, match="run C1 first"):
+            load_gold(str(tmp_path / "absent.jsonl"))
+
+    def test_loader_drift_fails_loudly(self, tmp_path):
+        path = _write_gold(tmp_path, pos=28)
+        with pytest.raises(ValueError, match="drifted"):
+            load_gold(path)
+
+    def test_loader_empty_prompt_in_scored_row_fails(self, tmp_path):
+        path = _write_gold(tmp_path)
+        lines = (tmp_path / "gold.jsonl").read_text().splitlines()
+        bad = json.loads(lines[0]); bad["prompt"] = ""
+        lines[0] = json.dumps(bad)
+        (tmp_path / "gold.jsonl").write_text("\n".join(lines) + "\n")
+        with pytest.raises(ValueError, match="run C1 first"):
+            load_gold(path)
+
+
+class TestConstantPrevalence:
+    """Baseline (a): constant score at gold prevalence; AUC = 0.5."""
+
+    def test_scores_equal_prevalence_and_auc_half(self):
+        rows = [{"label": "positive", "prompt": "x"}] * 3 + [{"label": "negative", "prompt": "y"}] * 7
+        scores = constant_prevalence_scores(rows)
+        assert scores == [0.3] * 10
+        labels = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+        assert auc(scores, labels) == 0.5
+
+
+class TestLexicalFeatures:
+    """Feature definitions from issue #3, on fixed synthetic prompts."""
+
+    def test_length_tokens_and_chars(self):
+        f = length_feature("fix the bug now")
+        assert f == {"length": 4, "length_chars": 15}
+
+    def test_imperative_density_fraction_of_clauses(self):
+        # two clauses, first imperative, second declarative -> 0.5
+        assert imperative_density("Fix the typo. The weather is nice") == 0.5
+        assert imperative_density("The weather is nice. Run the tests") == 0.5
+        assert imperative_density("") == 0.0
+        # non-imperative first tokens never match
+        assert imperative_density("Fixing it quickly") == 0.0
+
+    def test_deixis_per_100_tokens(self):
+        # 4 tokens, one deictic hit ("it") -> 100*1/4 = 25.0
+        assert deixis_density("look at it now") == 25.0
+        # phrase marker "the previous" counts once as phrase, not as "the"
+        assert deixis_density("check the previous round again") == 100.0 * 2 / 5  # phrase + again
+        # word "that" as pronoun, not inside "that's" only if word-bounded
+        assert deixis_density("that is it") == 100.0 * 2 / 3
+        assert deixis_density("") == 0.0
+
+    def test_output_contract_absence(self):
+        assert output_contract_absence("fix the bug") == 1.0
+        assert output_contract_absence("fix the bug and write it to out.json") == 0.0
+        assert output_contract_absence("update scripts/foo.py") == 0.0
+        assert output_contract_absence("the output must be a table") == 0.0
+        assert output_contract_absence("rename x to y") == 1.0
+
+    def test_lexical_features_returns_all_four(self):
+        # 'module.py' contains a sentence-splitting dot: two clauses, one imperative
+        f = lexical_features("fix the bug in module.py")
+        assert set(f) >= set(FEATURE_NAMES)
+        assert f["output_contract_absence"] == 0.0
+        assert f["imperative_density"] == 0.5
+
+
+class TestLogisticCombiner:
+    """Zero-dependency logistic fit: deterministic, separates synthetic data."""
+
+    def test_fit_deterministic_and_separates(self):
+        X = [[0.0], [0.1], [0.9], [1.0]]
+        y = [0, 0, 1, 1]
+        w1 = fit_logistic(X, y)
+        w2 = fit_logistic(X, y)
+        assert w1 == w2
+        s = [logistic_score(w1, x) for x in X]
+        # positives rank high
+        assert auc(s, y) == 1.0
+
+    def test_standardisation_zero_std_feature(self):
+        # a constant feature must not blow up: std 0 -> 0
+        rows = ([{"label": "positive", "prompt": "fix it"}] * 3
+                + [{"label": "negative", "prompt": "fine day"}] * 3)
+        scores, weights = combined_lexical_scores(rows)
+        assert len(scores) == 6 and len(weights) == 5
+        assert all(math.isfinite(s) for s in scores)
+
+
+class TestGoldBaselineEndToEnd:
+    """Loader + baselines over the synthetic gold fixture."""
+
+    def test_constant_and_lexical_over_fixture(self, tmp_path):
+        path = _write_gold(tmp_path)
+        rows, _ = load_gold(path)
+        scores = constant_prevalence_scores(rows)
+        labels = [1 if r["label"] == "positive" else 0 for r in rows]
+        assert auc(scores, labels) == 0.5
+        lex, _ = combined_lexical_scores(rows)
+        assert len(lex) == len(rows)

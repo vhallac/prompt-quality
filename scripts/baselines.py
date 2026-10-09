@@ -7,7 +7,10 @@ bootstrap 95% CI. No numpy/scipy/sklearn.
 
 from __future__ import annotations
 
+import json
+import math
 import random
+import re
 from collections.abc import Callable, Sequence
 
 # ---------------------------------------------------------------------------
@@ -156,3 +159,215 @@ def bootstrap_ci(
         "seed": seed,
         "degenerate_resamples": degenerate,
     }
+
+
+# ---------------------------------------------------------------------------
+# Gold loader (unit-002)
+# ---------------------------------------------------------------------------
+
+GOLD_PATH = "dataset/rounds-labeled.jsonl"
+
+
+def load_gold(path: str = GOLD_PATH) -> tuple[list[dict], dict]:
+    """Load the C1 gold set. Returns (scored rows, split tally).
+
+    Scored rows carry only label ('positive'/'negative') and 'prompt';
+    'excluded' rows are dropped from the denominator but counted in the
+    tally. Fails with 'run C1 first' when the artifact is absent, and
+    loudly when the split drifts from the recorded gold arithmetic
+    (242 = 29 positive + 205 negative + 8 excluded).
+    """
+    try:
+        f = open(path)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"gold set not found at {path} — run C1 first (build-dataset.py)"
+        ) from None
+    with f:
+        rows = [json.loads(line) for line in f]
+    tally = {"positive": 0, "negative": 0, "excluded": 0}
+    for r in rows:
+        label = r.get("label")
+        if label not in tally:
+            raise ValueError(f"unknown gold label {label!r} on id {r.get('id')}")
+        tally[label] += 1
+    EXPECTED = {"positive": 29, "negative": 205, "excluded": 8, "total": 242}
+    if tally != {k: EXPECTED[k] for k in tally} or len(rows) != EXPECTED["total"]:
+        raise ValueError(
+            f"gold split drifted: {tally}, expected 29/205/8 over 242 rows"
+        )
+    scored = [
+        {"id": r["id"], "label": r["label"], "prompt": r["prompt"]}
+        for r in rows
+        if r["label"] != "excluded"
+    ]
+    if any(not r["prompt"] for r in scored):
+        raise ValueError("empty prompt in scored gold rows — run C1 first")
+    return scored, tally
+
+
+def constant_prevalence_scores(rows: list[dict]) -> list[float]:
+    """Baseline (a): every row scored at the gold positive prevalence.
+
+    AUC is 0.5 by construction; this is the floor.
+    """
+    prev = sum(1 for r in rows if r["label"] == "positive") / len(rows)
+    return [prev] * len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Baseline (b): lexical features
+# ---------------------------------------------------------------------------
+
+# Feature definitions — printed into the metrics file by unit-004.
+IMPERATIVE_VERBS = frozenset(
+    """fix add remove write rename run check update create delete implement
+    change make use do try build install set enable disable move copy refactor
+    replace revert merge commit push pull test verify deploy configure""".split()
+)
+
+DEICTIC_MARKERS = (
+    "the previous", "as discussed",
+    "it", "that", "this", "yes", "again", "he", "she", "they", "them",
+)
+
+FORMAT_WORDS = frozenset(
+    """json yaml yml markdown md csv tsv xml table list bullet format
+    schema template snippet diff patch""".split()
+)
+
+CONTRACT_PHRASES = ("must", "should", "acceptance", "criteria", "requirement", "deliverable")
+
+
+def _clauses(text: str) -> list[str]:
+    parts = re.split(r"[.!?\n;]+", text)
+    return [p for p in (c.strip() for c in parts) if p]
+
+
+def _tokens(text: str) -> list[str]:
+    return text.split()
+
+
+def _word_count(text: str, word: str) -> int:
+    return len(re.findall(rf"\b{re.escape(word)}\b", text.lower()))
+
+
+def length_feature(prompt: str) -> dict:
+    """`length` — whitespace-token count (chars also recorded)."""
+    return {"length": len(_tokens(prompt)), "length_chars": len(prompt)}
+
+
+def imperative_density(prompt: str) -> float:
+    """`imperative_density` — fraction of clauses whose first token is an
+    imperative verb (IMPERATIVE_VERBS). Empty prompts score 0."""
+    clauses = _clauses(prompt)
+    if not clauses:
+        return 0.0
+    firsts = sum(
+        1
+        for c in clauses
+        if re.sub(r"[^\w-]", "", c.split()[0].lower()) in IMPERATIVE_VERBS
+    )
+    return firsts / len(clauses)
+
+
+def deixis_density(prompt: str) -> float:
+    """`deixis` — deictic/back-reference marker count per 100 tokens."""
+    toks = _tokens(prompt)
+    if not toks:
+        return 0.0
+    low = prompt.lower()
+    hits = sum(_word_count(low, m) if " " not in m else low.count(m) for m in DEICTIC_MARKERS)
+    return 100.0 * hits / len(toks)
+
+
+def output_contract_absence(prompt: str) -> float:
+    """`output_contract_absence` — 1 when the prompt states no explicit
+    deliverable (no file path, no format word, no acceptance/'must'
+    phrasing), else 0."""
+    low = prompt.lower()
+    has_path = bool(re.search(r"[\w./-]+\.[a-z]{1,5}\b", low)) or "/" in prompt
+    has_format = any(w in FORMAT_WORDS for w in (t.strip(".,:;!?()") for t in _tokens(low)))
+    has_phrase = any(p in low for p in CONTRACT_PHRASES)
+    return 0.0 if (has_path or has_format or has_phrase) else 1.0
+
+
+def lexical_features(prompt: str) -> dict[str, float]:
+    """The four named lexical features of issue #3."""
+    feats = dict(length_feature(prompt))
+    feats["imperative_density"] = imperative_density(prompt)
+    feats["deixis"] = deixis_density(prompt)
+    feats["output_contract_absence"] = output_contract_absence(prompt)
+    return feats
+
+
+FEATURE_NAMES = [
+    "length", "imperative_density", "deixis", "output_contract_absence",
+]
+
+# ---------------------------------------------------------------------------
+# Logistic combiner (zero-dependency, fixed seed)
+# ---------------------------------------------------------------------------
+
+LOGISTIC_SEED = 20260109
+LOGISTIC_EPOCHS = 2000
+LOGISTIC_LR = 0.1
+LOGISTIC_L2 = 1e-3
+
+
+def fit_logistic(
+    X: list[list[float]],
+    y: list[int],
+    epochs: int = LOGISTIC_EPOCHS,
+    lr: float = LOGISTIC_LR,
+    l2: float = LOGISTIC_L2,
+    seed: int = LOGISTIC_SEED,
+) -> list[float]:
+    """Plain gradient descent on L2-regularised logistic loss.
+
+    Deterministic: weights init to zeros, fixed epoch/lr; the seed is
+    recorded for provenance but the fit does not sample.
+    Returns [w0, w1..wd] (bias first).
+    """
+    d = len(X[0])
+    n = len(X)
+    w = [0.0] * (d + 1)
+    for _ in range(epochs):
+        grad = [0.0] * (d + 1)
+        for xi, yi in zip(X, y):
+            z = w[0] + sum(wj * xj for wj, xj in zip(w[1:], xi))
+            p = 1.0 / (1.0 + math.exp(-max(min(z, 30.0), -30.0)))
+            err = p - yi
+            grad[0] += err
+            for j in range(d):
+                grad[j + 1] += err * xi[j]
+        for j in range(d + 1):
+            g = grad[j] / n + (l2 * w[j] if j > 0 else 0.0)
+            w[j] -= lr * g
+    return w
+
+
+def logistic_score(weights: list[float], x: list[float]) -> float:
+    """Raw logit — monotone in probability, so it is a valid AUC score."""
+    return weights[0] + sum(wj * xj for wj, xj in zip(weights[1:], x))
+
+
+def combined_lexical_scores(rows: list[dict]) -> tuple[list[float], list[float]]:
+    """Fit the logistic combiner on the gold rows' standardised features and
+    return (scores, weights). Standardisation uses the corpus mean/std
+    (std 0 features stay at 0)."""
+    feats = [lexical_features(r["prompt"]) for r in rows]
+    X_raw = [[f[name] for name in FEATURE_NAMES] for f in feats]
+    d = len(FEATURE_NAMES)
+    means = [sum(x[j] for x in X_raw) / len(X_raw) for j in range(d)]
+    stds = [
+        math.sqrt(sum((x[j] - means[j]) ** 2 for x in X_raw) / len(X_raw))
+        for j in range(d)
+    ]
+    X = [
+        [0.0 if stds[j] == 0 else (x[j] - means[j]) / stds[j] for j in range(d)]
+        for x in X_raw
+    ]
+    y = [1 if r["label"] == "positive" else 0 for r in rows]
+    weights = fit_logistic(X, y)
+    return [logistic_score(weights, x) for x in X], weights
