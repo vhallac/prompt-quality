@@ -892,3 +892,194 @@ def test_cross_check_gold_never_reaches_the_frame(tmp_path: Path) -> None:
     assert set(manifest["sampled_ids"]).isdisjoint(corpus[:3])
     assert set(manifest["missing_ids"]).isdisjoint(corpus[:3])
     assert manifest["frame_size"] == len(corpus) - manifest["gold_size"]
+
+
+# --- unit-005: CLI wiring (--out, run_adjudication, key + cache) -------------
+
+
+def _cli_fixture(tmp_path: Path, monkeypatch=None):
+    """A minimal corpus/gold/store for CLI paths that don't need the live frame.
+
+    The frame is *not* the live one, so callers must use ``--manifest-only``
+    for the no-key path or inject fakes for the live path. When ``monkeypatch``
+    is supplied, the live-anchor guard is neutralised and the live ``DROP_IDS``
+    are dropped: ``assert_anchors`` demands the live 5430/244/5159 numbers, and
+    ``DROP_IDS`` are live ids absent from a synthetic corpus. Both stay
+    unconditional in production.
+    """
+    if monkeypatch is not None:
+        monkeypatch.setattr(sbr, "assert_anchors", lambda manifest: None)
+        monkeypatch.setattr(sbr, "DROP_IDS", frozenset())
+    corpus = [f"id{i:03d}" for i in range(150)]
+    _write_jsonl(tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus])
+    _write_jsonl(tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:10]])
+    store = _make_store(tmp_path, corpus[10:])
+    return [
+        "--sample-size", "100",
+        "--corpus", str(tmp_path / "corpus.jsonl"),
+        "--gold", str(tmp_path / "gold.jsonl"),
+        "--rounds-dir", str(store),
+        "--manifest", str(tmp_path / "manifest.json"),
+    ]
+
+
+def test_cli_manifest_only_needs_no_api_key(tmp_path: Path, monkeypatch, capsys) -> None:
+    """The frame+sample step must stay runnable with no key and no network."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    rc = sbr.main(_cli_fixture(tmp_path, monkeypatch) + ["--manifest-only"])
+    assert rc == 0
+    assert (tmp_path / "manifest.json").exists()
+
+
+def test_cli_without_key_fails_loudly(tmp_path: Path, monkeypatch) -> None:
+    """Adjudication with no key must abort, not silently do nothing."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        sbr.main(_cli_fixture(tmp_path, monkeypatch))
+    assert "key" in str(excinfo.value).lower()
+
+
+def test_cli_out_flag_routes_results(tmp_path: Path, monkeypatch) -> None:
+    """``--out`` must be the path adjudicated rows are appended to."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    out = tmp_path / "results.jsonl"
+    seen_paths: list[str] = []
+
+    class _Stub:
+        def llm_request(self, system, user, api_key, model, max_retries=3):
+            return "{}"
+
+        def process_round(self, rid, rounds_dir, api_key, args, stages):
+            return {"id": rid, "bin": "no-fault-within-round"}
+
+    def fake_load_s2(path=None):
+        return _Stub()
+
+    def fake_run(manifest, results=(), adjudicate=None, append=None, backfill=None,
+                 min_rows=100, max_rounds=5):
+        seen_paths.append("called")
+        # Drive the real append closure so --out routing is genuinely tested.
+        for rid in manifest["sampled_ids"][:min_rows]:
+            append(adjudicate(rid))
+        return {"n": min_rows, "positive": 0, "negative": min_rows,
+                "ambiguous": 0, "fault_rate": 0.0, "ci_low": 0.0,
+                "ci_high": 0.0, "unresolved": []}
+
+    monkeypatch.setattr(sbr, "load_s2_module", fake_load_s2)
+    monkeypatch.setattr(sbr, "run_adjudication", fake_run)
+    rc = sbr.main(_cli_fixture(tmp_path, monkeypatch) + ["--out", str(out)])
+    assert rc == 0
+    assert out.exists()
+    assert len(sbr.load_results(out)) == 100
+    assert seen_paths == ["called"]
+
+
+def test_cli_cache_round_trips_when_supplied(tmp_path: Path, monkeypatch) -> None:
+    """A supplied ``--cache`` file is read and written around the run."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text('{"pre": "existing"}\n', encoding="utf-8")
+
+    class _Stub:
+        def llm_request(self, system, user, api_key, model, max_retries=3):
+            return "{}"
+
+        def process_round(self, rid, rounds_dir, api_key, args, stages):
+            return {"id": rid, "bin": "no-fault-within-round"}
+
+    monkeypatch.setattr(sbr, "load_s2_module", lambda path=None: _Stub())
+
+    def fake_run(manifest, results=(), adjudicate=None, append=None, backfill=None,
+                 min_rows=100, max_rounds=5):
+        return {"n": min_rows, "positive": 0, "negative": min_rows,
+                "ambiguous": 0, "fault_rate": 0.0, "ci_low": 0.0,
+                "ci_high": 0.0, "unresolved": []}
+
+    monkeypatch.setattr(sbr, "run_adjudication", fake_run)
+    rc = sbr.main(_cli_fixture(tmp_path, monkeypatch) + ["--cache", str(cache_path)])
+    assert rc == 0
+    # The pre-existing entry survived the save (load-then-save, no clobber).
+    saved = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert saved.get("pre") == "existing"
+
+
+def test_resolve_api_key_prefers_explicit_then_env(monkeypatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert sbr.resolve_api_key("explicit") == "explicit"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "from-env")
+    assert sbr.resolve_api_key(None) == "from-env"
+    assert sbr.resolve_api_key("explicit") == "explicit"
+
+
+def test_adjudicate_one_wraps_null_completion_as_unavailable() -> None:
+    """A null LLM reply must surface as AdjudicationUnavailable, not AttributeError.
+
+    The provider can return ``choices[0].message.content == null``; the
+    imported parser then calls ``text.strip()`` on ``None``. That transient
+    failure must be a typed, catchable "unresolved" signal.
+    """
+
+    class _NullS2:
+        def process_round(self, rid, rounds_dir, api_key, args, stages):
+            raise AttributeError("'NoneType' object has no attribute 'strip'")
+
+    with pytest.raises(sbr.AdjudicationUnavailable):
+        sbr.adjudicate_one("r1", s2_module=_NullS2())
+
+
+def test_run_adjudication_survives_unavailable_replies() -> None:
+    """An unavailable reply drops the id as unresolved instead of aborting."""
+    manifest = {"seed": 3, "sampled_ids": ["s0", "s1", "s2"]}
+
+    def adjudicate(rid):
+        if rid == "s1":
+            raise sbr.AdjudicationUnavailable(rid)
+        return {"id": rid, "bin": "no-fault-within-round"}
+
+    report = sbr.run_adjudication(
+        manifest,
+        adjudicate=adjudicate,
+        append=lambda rec: True,
+        backfill=lambda m, r: [],
+        min_rows=2,
+    )
+    assert report["n"] == 2
+    assert report["unresolved"] == ["s1"]
+
+
+def test_cli_cache_is_persisted_after_each_row(tmp_path: Path, monkeypatch) -> None:
+    """The cache file must exist during the run, not only on clean exit.
+
+    The live pass is paid; a crash after N adjudications must leave a cache on
+    disk. This asserts the file is created and stays valid JSON even when the
+    adjudication seam never reaches ``llm_request`` (a stubbed S2 still drives
+    the per-row save).
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    cache_path = tmp_path / "cache.json"
+    out = tmp_path / "results.jsonl"
+
+    class _Stub:
+        def llm_request(self, system, user, api_key, model, max_retries=3):
+            return "{}"
+
+        def process_round(self, rid, rounds_dir, api_key, args, stages):
+            return {"id": rid, "bin": "no-fault-within-round"}
+
+    monkeypatch.setattr(sbr, "load_s2_module", lambda path=None: _Stub())
+
+    rc = sbr.main(
+        _cli_fixture(tmp_path, monkeypatch)
+        + [
+            "--out", str(out),
+            "--cache", str(cache_path),
+            "--min-rows", "3",
+        ]
+    )
+    assert rc == 0
+    assert cache_path.exists()
+    assert isinstance(json.loads(cache_path.read_text(encoding="utf-8")), dict)
+    # The synthetic run must land in tmp_path, never the committed artifact.
+    # ``run_adjudication`` walks the whole resume plan before consulting
+    # ``min_rows`` (which only gates backfill), so all 100 sampled ids land.
+    assert len(sbr.load_results(out)) == 100

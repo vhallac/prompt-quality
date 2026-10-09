@@ -380,6 +380,17 @@ def cached_llm(s2_module, cache: dict[str, str]):
         s2_module.llm_request = original
 
 
+class AdjudicationUnavailable(RuntimeError):
+    """A round could not be adjudicated because the LLM gave no usable reply.
+
+    Raised when the upstream machinery crashes on a null/empty completion (the
+    provider can return ``choices[0].message.content == null``). A transient
+    provider hiccup must not abort a long paid pass: ``run_adjudication``
+    treats this like a missing round file — drop the id, record it as
+    unresolved, and let backfill find a replacement.
+    """
+
+
 def adjudicate_one(
     rid: str,
     rounds_dir: str | Path = DEFAULT_ROUND_STORE,
@@ -392,12 +403,24 @@ def adjudicate_one(
     Delegates to the imported ``process_round`` with ``stages={'S2'}``: no
     S0/S1 ranking, no S3/S4 re-route. The record carries the round id, the
     S2 verdict/fault_type/root_cause, and the derived ``bin``.
+
+    A null/unparseable completion raises :class:`AdjudicationUnavailable`
+    rather than propagating an ``AttributeError`` from deep inside the
+    imported parser, so one bad reply cannot kill a paid pass.
     """
     if s2_module is None:
         s2_module = load_s2_module()
     if args is None:
         args = S2Args()
-    return s2_module.process_round(rid, Path(rounds_dir), api_key, args, set(S2_STAGES))
+    try:
+        return s2_module.process_round(
+            rid, Path(rounds_dir), api_key, args, set(S2_STAGES)
+        )
+    except (TypeError, AttributeError, ValueError) as exc:
+        # The imported parser calls ``text.strip()`` and ``json.loads`` on the
+        # completion; a null completion surfaces as one of these. Re-raise as
+        # an explicit "this round is unresolved" signal.
+        raise AdjudicationUnavailable(f"{rid}: unusable LLM reply ({exc})") from exc
 
 
 # --- Results transcript + resume-on-union ------------------------------------
@@ -634,7 +657,7 @@ def run_adjudication(
         for rid in todo:
             try:
                 record = adjudicate(rid)
-            except FileNotFoundError:
+            except (FileNotFoundError, AdjudicationUnavailable):
                 unresolved.append(rid)
                 continue
             if append(record):
@@ -654,6 +677,14 @@ def run_adjudication(
 # --- CLI ---------------------------------------------------------------------
 
 
+def resolve_api_key(explicit: str | None = None) -> str | None:
+    """Resolve the OpenRouter key: explicit flag, then ``OPENROUTER_API_KEY``.
+
+    The key is never logged or persisted; only its presence is reported.
+    """
+    return explicit or os.environ.get("OPENROUTER_API_KEY") or None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -662,6 +693,37 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gold", default=str(DEFAULT_GOLD))
     ap.add_argument("--rounds-dir", default=str(DEFAULT_ROUND_STORE))
     ap.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="adjudicated results transcript (default: --results / DEFAULT_RESULTS)",
+    )
+    ap.add_argument(
+        "--results",
+        default=str(DEFAULT_RESULTS),
+        help="where adjudicated rows are appended (resume reads this too)",
+    )
+    ap.add_argument(
+        "--min-rows",
+        type=int,
+        default=MIN_ROWS,
+        help="minimum adjudicated rows before a report is emitted",
+    )
+    ap.add_argument(
+        "--cache",
+        default=None,
+        help="optional {cache_key: response} JSON file to reuse/save LLM calls",
+    )
+    ap.add_argument(
+        "--api-key",
+        default=None,
+        help="OpenRouter key (defaults to $OPENROUTER_API_KEY)",
+    )
+    ap.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="only rebuild/write the sample manifest (no adjudication)",
+    )
     args = ap.parse_args(argv)
 
     manifest = build_manifest(
@@ -672,14 +734,68 @@ def main(argv: list[str] | None = None) -> int:
         round_store=args.rounds_dir,
     )
     assert_anchors(manifest)
-    out = write_manifest(manifest, args.manifest)
+    manifest_out = write_manifest(manifest, args.manifest)
     print(
         f"frame={manifest['frame_size']} "
         f"(corpus={manifest['corpus_size']} − gold={manifest['gold_size']} "
         f"− missing={manifest['missing_size']}) "
         f"seed={manifest['seed']} sampled={len(manifest['sampled_ids'])}"
     )
-    print(f"wrote {out}")
+    print(f"wrote {manifest_out}")
+    if args.manifest_only:
+        return 0
+
+    # ``--out`` is the plan's verify-command flag for the results transcript.
+    results_path = Path(args.out or args.results)
+    api_key = resolve_api_key(args.api_key)
+    if not api_key:
+        raise SystemExit(
+            "no OpenRouter key: pass --api-key or set OPENROUTER_API_KEY"
+        )
+
+    existing = load_results(results_path)
+    s2_module = load_s2_module()
+    cache: dict[str, str] = {}
+    cache_path = Path(args.cache) if args.cache else None
+    if cache_path is not None:
+        cache = load_llm_cache(cache_path)
+
+    def adjudicate(rid: str) -> dict:
+        return adjudicate_one(rid, s2_module=s2_module, api_key=api_key)
+
+    def append(rec: dict) -> bool:
+        written = append_result(rec, results_path)
+        # Persist the cache after every adjudicated row: the pass is paid and
+        # long, so a crash or kill must never discard completed LLM calls.
+        if cache_path is not None:
+            save_llm_cache(cache, cache_path)
+        return written
+
+    with cached_llm(s2_module, cache):
+        report = run_adjudication(
+            manifest,
+            results=existing,
+            adjudicate=adjudicate,
+            append=append,
+            min_rows=args.min_rows,
+        )
+        if cache_path is not None:
+            save_llm_cache(cache, cache_path)
+            print(f"cache: {len(cache)} entries → {cache_path}")
+
+    print(
+        f"adjudicated n={report['n']} rows "
+        f"(positive={report['positive']} negative={report['negative']} "
+        f"ambiguous={report['ambiguous']})"
+    )
+    print(
+        f"fault_rate={report['fault_rate']:.4f} "
+        f"(95% CI {report['ci_low']:.4f}–{report['ci_high']:.4f})"
+    )
+    if report["unresolved"]:
+        print(f"unresolved={len(report['unresolved'])} ids")
+    print(f"wrote {results_path}")
+    print(json.dumps(report, sort_keys=True, ensure_ascii=False))
     return 0
 
 
