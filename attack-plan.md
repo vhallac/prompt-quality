@@ -71,6 +71,9 @@ asserts C3's copies against this file.
   prompt text, S2 bin, fault type, root-cause evidence; back-propagate origins;
   sample ~100 random rounds for base-rate S2 adjudication. Output:
   `dataset/rounds-labeled.jsonl` (gold, ~350), `dataset/prompt-corpus.jsonl` (5430 weak).
+  The store-time facts of the build are pinned in `dataset/c1-build-snapshot.json`, so the
+  corpus's unresolved ledger is a recorded input and a re-run on a moved round store reproduces
+  both artifacts byte-for-byte (see `design/decisions/002`).
 - **E2 — baselines.** (a) base rate; (b) lexical heuristics (length, imperative
   density, deixis, output-contract absence); (c) jev re-score in three variants —
   prompt-only (context stripped), prompt+own-response, and prompt+parent-response —

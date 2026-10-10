@@ -19,3 +19,4 @@ For stages with live API calls (C2, C3), the disk cache (see 008) makes the re-r
 - The in-process check catches serialization bugs; the external diff catches cache/persistence bugs.
 - Live-run stages are still non-deterministic on first run (API calls vary), but the warm-cache re-run is deterministic — the committed artifact is reproducible from the recorded seed and cache.
 - Extending the mechanism to a new stage requires only the same three layers, not a new determinism framework.
+- A stage whose inputs are *recorded* snapshots (C1: `design/decisions/002`, C2: `design/decisions/009`) adds one gate on top of the three: before writing, the build must render to the exact bytes already committed, or stop naming the first divergent row. A hand-edited artifact therefore halts a re-run instead of being silently normalised by it.

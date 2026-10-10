@@ -42,7 +42,10 @@ sampled ids still have their round files, `gold ∩ missing` is still exactly th
 two Q2 ids, and the ledger still reproduces 5159, so the C2 sample stands and was
 **not** re-adjudicated (`dataset/base-rate-results.jsonl` untouched). A larger
 frame is a future stage with its own recorded seed and its own anchors — never a
-mutation of this snapshot.
+mutation of this snapshot. C1's corpus side of the same movement (15 of its 30
+recorded unresolved ids have round files again) is pinned by
+`dataset/c1-build-snapshot.json` under `design/decisions/002`; the two ledgers
+agree on the same 29 no-round-file ids.
 
 ## Consequences
 - Frame drift (round files appearing or going missing) is disclosed at build

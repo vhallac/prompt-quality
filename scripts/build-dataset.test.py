@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Tests for scripts/build-dataset.py (C1 unit-001: dedupe + split).
+"""Tests for scripts/build-dataset.py (C1: dedupe, split, resolution, origins).
 
-Two layers:
-  * synthetic fixtures pin the dedupe/label logic without the live source;
-  * anchor tests assert the spec's verified numbers against the real
-    fault-pipeline.jsonl when it is reachable (skipped otherwise).
+Three layers:
+  * synthetic fixtures pin the dedupe/label/resolution logic without the live
+    source;
+  * pinned-snapshot anchors assert the spec's verified numbers against the
+    committed artifacts and ``dataset/c1-build-snapshot.json`` -- no round store
+    is read, so they are green on a store that has moved since C1 was built;
+  * the live store appears only in the drift layer, which reports what moved by
+    field name and fails loudly where the snapshot's own claims break.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -261,32 +266,54 @@ pytestmark_store = pytest.mark.skipif(
 )
 
 
-@pytestmark_store
 def test_anchor_all_gold_prompts_resolved() -> None:
-    gold = bd.resolve_prompts(bd.gold_records(bd.load_records()))
-    assert bd.unresolved_ids(gold) == []
-    assert all(r.prompt and r.prompt_status == bd.PROMPT_RESOLVED for r in gold)
+    """The pinned record says gold is fully resolved; the artifacts agree.
+
+    U2: this used to re-resolve the 242 gold rows against the live store, so a
+    round file going missing upstream made the suite red for a fact that is
+    already settled -- the build that produced the committed gold artifact had
+    every prompt. The live store's ability to honour that claim is what
+    ``check_store_drift`` reports, not what this anchor asserts.
+    """
+    snapshot = _pinned_snapshot_or_skip()
+    assert snapshot["gold_unresolved"] == []
+    assert snapshot["gold_unresolved_size"] == 0
+    rows = [json.loads(l) for l in _read_artifact(bd.DEFAULT_GOLD_ARTIFACT)]
+    assert len(rows) == snapshot["gold_size"] == bd.EXPECTED_GOLD
+    assert [r["id"] for r in rows if r["prompt_status"] != bd.PROMPT_RESOLVED] == []
+    assert all(r["prompt"] for r in rows)
 
 
-@pytestmark_store
 def test_anchor_corpus_unresolved_split() -> None:
     """30 corpus ids are unresolved: 29 have no round file, 1 has an empty prompt.
 
     The spec's anchor counts "29 of 5430 scan ids have no round file"; the
     report's unresolved list is one larger because extension 3a also covers a
     round file whose ``userPrompt`` is empty (id a363b8d1...).
+
+    U2 retargets this from the live store to the pinned snapshot: the store today
+    resolves 15 of the 30 again (those rounds reappeared upstream), so scanning
+    it yields 15 and the spec's 30 becomes an unreachable claim. The numbers here
+    are literals from issue #1, and every one of them is a fact about the
+    committed record -- no round store present required.
     """
-    scan_ids = bd.read_scan_ids()
-    assert len(scan_ids) == bd.EXPECTED_CORPUS
-    corpus = bd.corpus_records(scan_ids)
-    assert len(corpus) == bd.EXPECTED_CORPUS
-    unresolved = bd.unresolved_ids(corpus)
+    snapshot = _pinned_snapshot_or_skip()
+    unresolved = snapshot["corpus_unresolved"]
     assert len(unresolved) == 30
-    store = Path(bd.DEFAULT_ROUND_STORE)
-    no_file = [i for i in unresolved if not (store / f"{i}.json").exists()]
-    empty_file = [i for i in unresolved if (store / f"{i}.json").exists()]
-    assert len(no_file) == 29
-    assert len(empty_file) == 1
+    assert len(snapshot["no_round_file_ids"]) == 29
+    assert snapshot["empty_prompt_ids"] == ["a363b8d13575101a0226e8d0d054f2e7"]
+    # The classification is a partition of the unresolved ledger.
+    assert set(unresolved) == set(snapshot["no_round_file_ids"]) | set(
+        snapshot["empty_prompt_ids"]
+    )
+    assert set(snapshot["no_round_file_ids"]).isdisjoint(snapshot["empty_prompt_ids"])
+    # The artifacts say the same thing as the record of them.
+    rebuilt = bd.reproduce_snapshot(snapshot)
+    assert rebuilt["corpus_unresolved"] == unresolved
+    rows = [json.loads(l) for l in _read_artifact(bd.DEFAULT_CORPUS_ARTIFACT)]
+    assert len(rows) == snapshot["corpus_size"] == 5430
+    assert sorted(r["id"] for r in rows if r["prompt"] is None) == unresolved
+    assert bd.load_snapshot(bd.DEFAULT_SNAPSHOT) == snapshot
 
 
 # --- origin back-propagation -------------------------------------------------
@@ -688,12 +715,27 @@ def test_first_divergent_field_names_row() -> None:
 
 @pytest.fixture(scope="module")
 def built(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """Run the full build into a scratch dir; return records, report, paths."""
+    """Run the pinned full build into a scratch dir; return records, report, paths.
+
+    U2: this is the build the committed artifacts came from, not a fresh scan of
+    today's store -- ids come from the pinned corpus record and the unresolved
+    ledger comes from the snapshot, so the acceptance numbers below are the
+    recorded ones. The live store still supplies prompt *text*, which is what
+    ``check_store_drift`` audits.
+    """
+    snapshot = bd.load_snapshot(bd.DEFAULT_SNAPSHOT)
     records = bd.load_records()
-    gold = bd.resolve_prompts(bd.gold_records(records))
+    gold = bd.resolve_prompts(
+        bd.gold_records(records),
+        bd.DEFAULT_ROUND_STORE,
+        snapshot["gold_unresolved"],
+    )
     bd.attach_origins(gold)
-    scan_ids = bd.read_scan_ids()
-    corpus = bd.corpus_records(scan_ids)
+    corpus = bd.corpus_records(
+        bd.artifact_ids(bd.DEFAULT_CORPUS_ARTIFACT),
+        bd.DEFAULT_ROUND_STORE,
+        snapshot["corpus_unresolved"],
+    )
     report = bd.build_report(gold, corpus)
     out = tmp_path_factory.mktemp("acceptance")
     paths = bd.emit_datasets(gold, corpus, out)
@@ -703,13 +745,31 @@ def built(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "corpus": corpus,
         "report": report,
         "paths": paths,
+        "snapshot": snapshot,
     }
+
+
+def _pinned_snapshot_or_skip() -> dict:
+    """The committed C1 snapshot, or a skip when the clone has no artifacts."""
+    for path in (
+        bd.DEFAULT_SNAPSHOT,
+        bd.DEFAULT_CORPUS_ARTIFACT,
+        bd.DEFAULT_GOLD_ARTIFACT,
+    ):
+        if not Path(path).exists():
+            pytest.skip(f"committed C1 artifact not present: {path}")
+    return bd.load_snapshot(bd.DEFAULT_SNAPSHOT)
+
+
+def _read_artifact(path: Path) -> list[str]:
+    return Path(path).read_text(encoding="utf-8").splitlines()
 
 
 pytestmark_acceptance = pytest.mark.skipif(
     not Path(bd.DEFAULT_FAULT_PIPELINE).exists()
-    or not Path(bd.DEFAULT_ROUND_STORE).exists(),
-    reason="source pipeline or round store not found",
+    or not Path(bd.DEFAULT_ROUND_STORE).exists()
+    or not Path(bd.DEFAULT_SNAPSHOT).exists(),
+    reason="source pipeline, pinned snapshot or round store not found",
 )
 
 
@@ -784,20 +844,36 @@ def test_acceptance_corpus_pinned_to_5430(built: dict) -> None:
     """The weak corpus is pinned to the 5430 frozen scan ids, not the live store."""
     assert len(built["corpus"]) == bd.EXPECTED_CORPUS == 5430
     assert len(bd.read_scan_ids()) == 5430
+    # The scan snapshot lives in a sibling checkout, so it is pinned by digest:
+    # the id universe behind the committed record must still be the one it holds.
+    assert bd.corpus_ids_sha256(bd.read_scan_ids()) == built["snapshot"][
+        "corpus_ids_sha256"
+    ]
 
 
 @pytestmark_acceptance
 def test_acceptance_corpus_unresolved_anchor(built: dict) -> None:
-    """29 scan ids have no round file, plus 1 empty prompt -> 30 listed."""
+    """29 scan ids have no round file, plus 1 empty prompt -> 30 listed.
+
+    U2: the numbers are asserted against the pinned snapshot, and the built
+    report must agree with it field for field. A live store that resolves 15 of
+    those 30 again is disclosed by ``check_store_drift`` and changes nothing here.
+    """
     report = built["report"]
+    snapshot = built["snapshot"]
     unresolved = report["corpus"]["unresolved"]
+    assert unresolved == snapshot["corpus_unresolved"]
+    assert bd.report_divergences(report, snapshot) == []
     assert len(unresolved) == 30
-    store = Path(bd.DEFAULT_ROUND_STORE)
-    no_file = [i for i in unresolved if not (store / f"{i}.json").exists()]
-    empty_file = [i for i in unresolved if (store / f"{i}.json").exists()]
-    assert len(no_file) == 29
-    assert len(empty_file) == 1
+    assert len(snapshot["no_round_file_ids"]) == 29
+    assert len(snapshot["empty_prompt_ids"]) == 1
     assert unresolved == sorted(unresolved)
+    # Every unresolved row reaches the artifact: the ledger is carried, not dropped.
+    corpus_rows = [
+        json.loads(l) for l in built["paths"]["corpus"].read_text().splitlines()
+    ]
+    assert sorted(r["id"] for r in corpus_rows if r["prompt"] is None) == unresolved
+    assert all(r["prompt"] is None for r in corpus_rows if r["id"] in set(unresolved))
 
 
 @pytestmark_acceptance
@@ -849,3 +925,902 @@ def test_acceptance_build_is_deterministic(built: dict) -> None:
         second = bd.emit_datasets(built["gold"], built["corpus"], b)
         for key in first:
             assert first[key].read_bytes() == second[key].read_bytes()
+
+
+# --- unit-011 (U2): the pinned C1 build snapshot ------------------------------
+#
+# The round store moves: of the 30 corpus ids C1 recorded as unresolved, 15 have
+# round files again upstream. Tests in this layer assert the *recorded* snapshot
+# and the committed artifacts, never a live scan, and the live store appears only
+# where a test is explicitly about drift. Fixture shape: 12 corpus ids -- 8
+# resolved from the store, 3 with no round file, 1 whose round file has a blank
+# prompt -- which is the real 5430 / 29 / 1 at a size a reader can hold in mind.
+
+PIN_IDS = [f"id{i:03d}" for i in range(12)]
+PIN_LEDGER = PIN_IDS[8:]  # the recorded unresolved ids (4)
+PIN_NO_FILE = PIN_IDS[8:11]  # 3 of them have no round file at all
+PIN_UNUSABLE = PIN_IDS[11:]  # 1 has a file whose prompt is unusable
+PIN_GOLD = PIN_IDS[:2]
+
+# The issue #1 resolution numbers, as literals. Not read from bd.EXPECTED_* or
+# bd.SNAPSHOT_ANCHORS: a test that generates its cases from the code's own anchor
+# table cannot notice an anchor being deleted from it.
+ISSUE_ONE_RESOLUTION = {
+    "corpus_size": 5430,
+    "corpus_resolved_size": 5400,
+    "corpus_unresolved_size": 30,
+    "no_round_file_size": 29,
+    "empty_prompt_size": 1,
+    "gold_size": 242,
+    "gold_unresolved_size": 0,
+}
+
+# Every field the pinned record must carry, as literals for the same reason.
+PIN_RECORD_FIELDS = (
+    "corpus_size",
+    "corpus_ids_sha256",
+    "corpus_resolved_size",
+    "corpus_unresolved_size",
+    "corpus_unresolved",
+    "no_round_file_size",
+    "no_round_file_ids",
+    "empty_prompt_size",
+    "empty_prompt_ids",
+    "gold_size",
+    "gold_unresolved_size",
+    "gold_unresolved",
+)
+
+
+def _pin_fixture(tmp_path: Path) -> dict:
+    """A committed corpus/gold pair, a round store, and the snapshot pinning them."""
+    store = tmp_path / "rounds"
+    store.mkdir()
+    for rid in PIN_IDS:
+        if rid in PIN_NO_FILE:
+            continue
+        _write_round(store, rid, "" if rid in PIN_UNUSABLE else f"prompt for {rid}")
+    corpus = bd.corpus_records(PIN_IDS, store, PIN_LEDGER)
+    gold = bd.resolve_prompts(
+        [bd.Record(id=rid, bin="other") for rid in PIN_GOLD], store, []
+    )
+    bd.attach_origins(gold, round_store=store)
+    snapshot = bd.build_snapshot(corpus, gold, PIN_NO_FILE, PIN_UNUSABLE)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    # The artifacts are written through the build's own serializer, so a pinned
+    # run has the exact committed bytes to reproduce (``_write_jsonl`` would not
+    # sort keys and the byte gate would fire on formatting).
+    corpus_path = dataset / bd.CORPUS_ARTIFACT
+    corpus_path.write_text(
+        bd.serialize_rows(bd.row_for(r) for r in corpus), encoding="utf-8"
+    )
+    gold_path = dataset / bd.GOLD_ARTIFACT
+    gold_path.write_text(
+        bd.serialize_rows(bd.row_for(r) for r in gold), encoding="utf-8"
+    )
+    snapshot_path = bd.write_snapshot(snapshot, dataset / bd.SNAPSHOT_ARTIFACT)
+    source = _write_jsonl(
+        tmp_path / "fault-pipeline.jsonl",
+        [{"id": rid, "bin": "other"} for rid in PIN_GOLD],
+    )
+    return {
+        "ids": PIN_IDS,
+        "ledger": PIN_LEDGER,
+        "no_file": PIN_NO_FILE,
+        "unusable": PIN_UNUSABLE,
+        "store": store,
+        "dataset": dataset,
+        "corpus_path": corpus_path,
+        "gold_path": gold_path,
+        "snapshot_path": snapshot_path,
+        "source": source,
+        "snapshot": snapshot,
+        "corpus": corpus,
+        "gold": gold,
+    }
+
+
+def _diverged_fields(message: str) -> list[str]:
+    """The field names a ``SnapshotError`` blames, parsed out of its message."""
+    tail = message.split("— ", 1)[1]
+    return [part.split(":", 1)[0].strip() for part in tail.split("; ")]
+
+
+def _bump(value):
+    return value + 1
+
+
+def _scramble(value):
+    return value[::-1]
+
+
+def _drop_last(value):
+    return value[:-1]
+
+
+def _drop_first(value):
+    return value[1:]
+
+
+def _rewrite_artifact(path: Path, mutate) -> None:
+    """Edit a committed artifact in place, keeping its canonical rendering."""
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    mutate(rows)
+    _write_jsonl(path, rows)
+
+
+def _rewrite_record_artifact(path: Path, mutate) -> None:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    mutate(rows)
+    path.write_text(
+        "".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in rows),
+        encoding="utf-8",
+    )
+
+
+# --- the pinned ledger is what decides resolution -----------------------------
+
+
+def test_pinned_ledger_keeps_a_reappeared_round_unresolved(tmp_path: Path) -> None:
+    """A round file that came back upstream cannot re-draw a recorded row.
+
+    The control half makes it discriminate: without the ledger the same store
+    resolves the id, so a regression to a live scan would fail here rather than
+    silently emit a different corpus.
+    """
+    fx = _pin_fixture(tmp_path)
+    rid = PIN_LEDGER[0]
+    _write_round(fx["store"], rid, "the round reappeared upstream")
+
+    pinned = bd.corpus_records(PIN_IDS, fx["store"], PIN_LEDGER)
+    assert bd.unresolved_ids(pinned) == PIN_LEDGER
+    rebuilt = [r for r in pinned if r.id == rid][0]
+    assert rebuilt.prompt is None
+    assert rebuilt.prompt_status == bd.PROMPT_UNRESOLVED
+
+    unpinned = bd.corpus_records(PIN_IDS, fx["store"])
+    assert [r for r in unpinned if r.id == rid][0].prompt_status == bd.PROMPT_RESOLVED
+    assert bd.unresolved_ids(unpinned) == PIN_LEDGER[1:]
+
+
+def test_pinned_ledger_never_fabricates_a_prompt(tmp_path: Path) -> None:
+    """The ledger marks rows unresolved; it does not invent text for them."""
+    fx = _pin_fixture(tmp_path)
+    corpus = bd.corpus_records(PIN_IDS, fx["store"], PIN_LEDGER)
+    for record in corpus:
+        if record.id in set(PIN_LEDGER):
+            assert record.prompt is None
+        else:
+            assert record.prompt == f"prompt for {record.id}"
+
+
+def test_pinned_ledger_ignores_ids_that_are_not_in_the_build(tmp_path: Path) -> None:
+    """A ledger entry for an absent id neither crashes nor adds a row."""
+    fx = _pin_fixture(tmp_path)
+    corpus = bd.corpus_records(PIN_IDS, fx["store"], [*PIN_LEDGER, "not-a-corpus-id"])
+    assert len(corpus) == len(PIN_IDS)
+    assert bd.unresolved_ids(corpus) == PIN_LEDGER
+
+
+def test_force_unresolved_none_is_the_fresh_draw_path(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    assert bd.unresolved_ids(bd.corpus_records(PIN_IDS, fx["store"])) == [
+        *PIN_NO_FILE,
+        *PIN_UNUSABLE,
+    ]
+
+
+def test_classify_unresolved_splits_by_round_file(tmp_path: Path) -> None:
+    """The store-time classification the artifacts themselves cannot show."""
+    fx = _pin_fixture(tmp_path)
+    assert bd.classify_unresolved(fx["corpus"], fx["store"]) == (
+        PIN_NO_FILE,
+        PIN_UNUSABLE,
+    )
+
+
+# --- the snapshot record ------------------------------------------------------
+
+
+def test_build_snapshot_is_the_record_of_a_build(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    snapshot = fx["snapshot"]
+    assert set(snapshot) == set(PIN_RECORD_FIELDS)
+    assert snapshot["corpus_size"] == 12
+    assert snapshot["corpus_resolved_size"] == 8
+    assert snapshot["corpus_unresolved"] == PIN_LEDGER
+    assert snapshot["no_round_file_ids"] == PIN_NO_FILE
+    assert snapshot["empty_prompt_ids"] == PIN_UNUSABLE
+    assert snapshot["gold_unresolved"] == []
+    assert snapshot["corpus_ids_sha256"] == bd.corpus_ids_sha256(PIN_IDS)
+
+
+def test_snapshot_round_trips_byte_identical(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    again = bd.load_snapshot(fx["snapshot_path"])
+    assert again == fx["snapshot"]
+    assert bd.snapshot_bytes(again) == fx["snapshot_path"].read_bytes()
+    other = bd.write_snapshot(again, tmp_path / "again.json")
+    assert other.read_bytes() == fx["snapshot_path"].read_bytes()
+
+
+def test_reproduce_snapshot_round_trips_the_fixture(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    assert bd.reproduce_snapshot(
+        fx["snapshot"], fx["corpus_path"], fx["gold_path"]
+    ) == fx["snapshot"]
+
+
+def test_reproduce_snapshot_needs_no_round_store(tmp_path: Path) -> None:
+    """The record is checkable on a machine with no rounds at all."""
+    fx = _pin_fixture(tmp_path)
+    shutil.rmtree(fx["store"])
+    assert bd.reproduce_snapshot(
+        fx["snapshot"], fx["corpus_path"], fx["gold_path"]
+    ) == fx["snapshot"]
+
+
+@pytest.mark.parametrize(
+    "field, tamper, expected",
+    [
+        ("corpus_size", _bump, {"corpus_size"}),
+        ("corpus_ids_sha256", _scramble, {"corpus_ids_sha256"}),
+        ("corpus_resolved_size", _bump, {"corpus_resolved_size"}),
+        ("corpus_unresolved_size", _bump, {"corpus_unresolved_size"}),
+        ("corpus_unresolved", _drop_last, {"corpus_unresolved"}),
+        ("gold_size", _bump, {"gold_size"}),
+        ("gold_unresolved_size", _bump, {"gold_unresolved_size"}),
+        ("gold_unresolved", lambda value: [PIN_GOLD[0]], {"gold_unresolved"}),
+        # A classification ledger is a record about the store, so tampering one
+        # blames its own count and the unresolved set it exists to cover.
+        ("no_round_file_size", _bump, {"no_round_file_size"}),
+        ("no_round_file_ids", _drop_first, {"no_round_file_size", "corpus_unresolved"}),
+        ("empty_prompt_size", _bump, {"empty_prompt_size"}),
+        (
+            "empty_prompt_ids",
+            lambda value: [*value, "zzz-not-a-round"],
+            {"empty_prompt_size", "empty_prompt_ids", "corpus_unresolved"},
+        ),
+    ],
+)
+def test_reproduce_snapshot_names_the_field_that_diverges(
+    tmp_path: Path, field: str, tamper, expected: set[str]
+) -> None:
+    """U2's loud failure: a mismatch blames the field it broke, by name."""
+    fx = _pin_fixture(tmp_path)
+    tampered = dict(fx["snapshot"])
+    tampered[field] = tamper(tampered[field])
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(tampered, fx["corpus_path"], fx["gold_path"])
+    message = str(excinfo.value)
+    assert set(_diverged_fields(message)) == expected, message
+    assert "recorded" in message and "re-derived" in message
+
+
+def test_reproduce_snapshot_requires_a_complete_record(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    partial = {"corpus_size": 12, "corpus_unresolved": PIN_LEDGER}
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(partial, fx["corpus_path"], fx["gold_path"])
+    message = str(excinfo.value)
+    assert "missing fields" in message
+    for field in ("corpus_ids_sha256", "no_round_file_ids", "gold_unresolved"):
+        assert field in message, message
+
+
+def test_reproduce_snapshot_keeps_the_ledger_canonical(tmp_path: Path) -> None:
+    """A hand-reordered or duplicated ledger is not the pinned ledger."""
+    fx = _pin_fixture(tmp_path)
+    reordered = dict(fx["snapshot"])
+    reordered["no_round_file_ids"] = list(reversed(PIN_NO_FILE))
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(reordered, fx["corpus_path"], fx["gold_path"])
+    assert set(_diverged_fields(str(excinfo.value))) == {"no_round_file_ids"}
+
+    duplicated = dict(fx["snapshot"])
+    duplicated["no_round_file_ids"] = sorted([*PIN_NO_FILE, PIN_NO_FILE[0]])
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(duplicated, fx["corpus_path"], fx["gold_path"])
+    assert set(_diverged_fields(str(excinfo.value))) == {"no_round_file_ids"}
+
+
+def test_reproduce_snapshot_rejects_an_overlapping_classification(
+    tmp_path: Path,
+) -> None:
+    """One id cannot be both a missing file and an unusable file."""
+    fx = _pin_fixture(tmp_path)
+    both = dict(fx["snapshot"])
+    both["no_round_file_ids"] = sorted([*PIN_NO_FILE, *PIN_UNUSABLE])
+    both["no_round_file_size"] = len(both["no_round_file_ids"])
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(both, fx["corpus_path"], fx["gold_path"])
+    assert "unusable-file" in str(excinfo.value)
+
+
+def test_digest_pins_the_id_universe(tmp_path: Path) -> None:
+    """Swap one id for an unseen one and only the digest can tell."""
+    fx = _pin_fixture(tmp_path)
+    swapped = sorted([*PIN_IDS[:11], "zzz-unseen-id"])
+    corpus_rows = [
+        json.loads(line) for line in fx["corpus_path"].read_text().splitlines()
+    ]
+    corpus_rows[0]["id"] = "zzz-unseen-id"
+    # keep the ledger meaningful: the swapped row is a resolved one
+    _write_jsonl(fx["corpus_path"], corpus_rows)
+    snapshot = dict(fx["snapshot"])
+    snapshot["corpus_ids_sha256"] = bd.corpus_ids_sha256(swapped)
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(snapshot, fx["corpus_path"], fx["gold_path"])
+    assert "corpus_ids_sha256" in _diverged_fields(str(excinfo.value))
+
+
+def test_digest_is_independent_of_row_order(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    rows = [
+        json.loads(line) for line in fx["corpus_path"].read_text().splitlines()
+    ]
+    _write_jsonl(fx["corpus_path"], list(reversed(rows)))
+    assert bd.reproduce_snapshot(
+        fx["snapshot"], fx["corpus_path"], fx["gold_path"]
+    ) == fx["snapshot"]
+
+
+def test_reproduce_detects_a_flipped_status_row(tmp_path: Path) -> None:
+    """An artifact edited to claim a recorded-missing round has text fails loudly."""
+
+    def flip(rows):
+        for row in rows:
+            if row["prompt_status"] != bd.PROMPT_RESOLVED:
+                row["prompt_status"] = bd.PROMPT_RESOLVED
+                return
+
+    fx = _pin_fixture(tmp_path)
+    _rewrite_artifact(fx["corpus_path"], flip)
+    with pytest.raises(bd.SnapshotError) as excinfo:
+        bd.reproduce_snapshot(fx["snapshot"], fx["corpus_path"], fx["gold_path"])
+    named = set(_diverged_fields(str(excinfo.value)))
+    assert {
+        "corpus_unresolved",
+        "corpus_unresolved_size",
+        "corpus_resolved_size",
+    } <= named
+
+
+# --- the hand-maintained anchors ----------------------------------------------
+
+
+@pytest.mark.parametrize("field", sorted(ISSUE_ONE_RESOLUTION))
+def test_assert_anchors_names_the_field_that_drifted(field: str) -> None:
+    snapshot = dict(ISSUE_ONE_RESOLUTION)
+    snapshot[field] += 1
+    with pytest.raises(SystemExit) as excinfo:
+        bd.assert_anchors(snapshot)
+    message = str(excinfo.value)
+    assert message.startswith(f"{field} drift: "), message
+    got = ISSUE_ONE_RESOLUTION[field] + 1
+    assert f"expected {ISSUE_ONE_RESOLUTION[field]}, got {got}" in message
+
+
+def test_assert_anchors_accepts_the_issue_one_numbers() -> None:
+    bd.assert_anchors(dict(ISSUE_ONE_RESOLUTION))
+
+
+def test_anchor_table_and_field_list_are_the_declared_record() -> None:
+    """The anchor table governs the declared fields -- checked as literals.
+
+    Both tables are written out here rather than read from the module, so an
+    anchor or a snapshot field deleted from the code cannot delete its own test.
+    """
+    assert bd.SNAPSHOT_FIELDS == PIN_RECORD_FIELDS
+    assert set(bd.SNAPSHOT_ANCHORS) == {
+        (field, value) for field, value in ISSUE_ONE_RESOLUTION.items()
+    }
+
+
+# --- the live store is a report, graded by what it invalidates ----------------
+
+
+def test_drift_is_quiet_on_a_matching_store(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    report = bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    assert report["drifted_fields"] == []
+    assert report["recovered_ids"] == []
+    assert report["lost_round_file_ids"] == []
+    assert report["prompt_text_mismatch_ids"] == []
+    assert report["live_unresolved_size"] == report["recorded_unresolved_size"] == 4
+    assert "drift: none" in bd.drift_summary(report)
+
+
+def test_drift_reports_a_reappeared_round_without_redrawing_it(tmp_path: Path) -> None:
+    """Recovered rounds widen a hypothetical corpus; the record stays put."""
+    fx = _pin_fixture(tmp_path)
+    rid = PIN_NO_FILE[0]
+    _write_round(fx["store"], rid, "this round came back")
+    report = bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    assert report["recovered_ids"] == [rid]
+    assert report["recovered_no_round_file_ids"] == [rid]
+    assert set(report["drifted_fields"]) == {
+        "corpus_unresolved",
+        "corpus_unresolved_size",
+        "corpus_resolved_size",
+        "no_round_file_ids",
+        "no_round_file_size",
+    }
+    assert report["live_unresolved_size"] == 3
+    assert "the corpus was not re-drawn" in bd.drift_summary(report)
+    # The pin is undisturbed by what the store now says.
+    assert bd.reproduce_snapshot(
+        fx["snapshot"], fx["corpus_path"], fx["gold_path"]
+    ) == fx["snapshot"]
+    assert bd.unresolved_ids(
+        bd.corpus_records(PIN_IDS, fx["store"], fx["snapshot"]["corpus_unresolved"])
+    ) == PIN_LEDGER
+
+
+def test_drift_classifies_a_repaired_file_as_an_empty_prompt_recovery(
+    tmp_path: Path,
+) -> None:
+    fx = _pin_fixture(tmp_path)
+    rid = PIN_UNUSABLE[0]
+    _write_round(fx["store"], rid, "the prompt was filled in")
+    report = bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    assert report["recovered_unusable_file_ids"] == [rid]
+    assert set(report["drifted_fields"]) == {
+        "corpus_unresolved",
+        "corpus_unresolved_size",
+        "corpus_resolved_size",
+        "empty_prompt_ids",
+        "empty_prompt_size",
+    }
+
+
+def test_drift_fails_loudly_when_a_recorded_prompt_is_gone(tmp_path: Path) -> None:
+    """A row the artifacts claim is resolved must still be re-derivable."""
+    fx = _pin_fixture(tmp_path)
+    victim = next(i for i in PIN_IDS if i not in set(PIN_LEDGER))
+    (fx["store"] / f"{victim}.json").unlink()
+    with pytest.raises(bd.StoreDriftError) as excinfo:
+        bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    message = str(excinfo.value)
+    assert "lost_round_file_ids=1" in message
+    assert victim in message
+
+
+def test_drift_fails_loudly_when_recorded_prompt_text_changed(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    victim = next(i for i in PIN_IDS if i not in set(PIN_LEDGER))
+    _write_round(fx["store"], victim, "rewritten after the build")
+    with pytest.raises(bd.StoreDriftError) as excinfo:
+        bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    message = str(excinfo.value)
+    assert "prompt_text_mismatch_ids=1" in message
+    assert victim in message
+
+
+def test_drift_compare_is_redaction_aware(tmp_path: Path) -> None:
+    """A committed prompt that is the redacted store text is not a mismatch.
+
+    The artifact holds ``[REDACTED]`` where the round file still holds the key the
+    user pasted; comparing raw text would report every such row as drift.
+    """
+    fx = _pin_fixture(tmp_path)
+    victim = next(i for i in PIN_IDS if i not in set(PIN_LEDGER))
+    secret = "sk-or-v1-" + "a" * 64
+    _write_round(fx["store"], victim, f"paste my key: {secret}")
+    _rewrite_record_artifact(
+        fx["corpus_path"],
+        lambda rows: [
+            row.update(prompt=f"paste my key: {bd.REDACTION_PLACEHOLDER}")
+            for row in rows
+            if row["id"] == victim
+        ],
+    )
+    report = bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    assert report["prompt_text_mismatch_ids"] == []
+
+
+def test_drift_ignores_rounds_that_are_not_in_the_pinned_universe(
+    tmp_path: Path,
+) -> None:
+    """The store growing past the corpus is not drift in anything the pin claims."""
+    fx = _pin_fixture(tmp_path)
+    for n in range(50):
+        _write_round(fx["store"], f"unrelated{n:03d}", "a round from later")
+    report = bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+    assert report["drifted_fields"] == []
+    assert report["store_round_files"] == len(PIN_IDS) + 50 - len(PIN_NO_FILE)
+
+
+def test_drift_without_a_store_is_a_loud_absence_not_a_silence(tmp_path: Path) -> None:
+    """No store means no prompt text: the snapshot cannot honour its rows."""
+    fx = _pin_fixture(tmp_path)
+    shutil.rmtree(fx["store"])
+    with pytest.raises(bd.StoreDriftError):
+        bd.check_store_drift(
+        fx["snapshot"], round_store=fx["store"], corpus_path=fx["corpus_path"]
+    )
+
+
+def test_store_drift_error_is_a_snapshot_error() -> None:
+    assert issubclass(bd.StoreDriftError, bd.SnapshotError)
+
+
+# --- the built report must agree with the record ------------------------------
+
+
+def test_report_divergences_accepts_the_pinned_build(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    report = bd.build_report(fx["gold"], fx["corpus"], fx["store"])
+    assert bd.report_divergences(report, fx["snapshot"]) == []
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (lambda r: r["corpus"]["unresolved"].append("zzz"), "corpus_unresolved"),
+        (lambda r: r["corpus"].update(total=99), "corpus_size"),
+        (lambda r: r["gold"]["unresolved"].append(PIN_GOLD[0]), "gold_unresolved"),
+        (lambda r: r["gold"].update(total=99), "gold_size"),
+    ],
+)
+def test_report_divergences_names_the_contradiction(
+    tmp_path: Path, mutate, field: str
+) -> None:
+    fx = _pin_fixture(tmp_path)
+    report = bd.build_report(fx["gold"], fx["corpus"], fx["store"])
+    mutate(report)
+    diverged = bd.report_divergences(report, fx["snapshot"])
+    assert [line.split(":", 1)[0] for line in diverged] == [field]
+    assert "snapshot" in diverged[0] and "built" in diverged[0]
+
+
+# --- committed-artifact anchors (no round store required) ---------------------
+
+
+def test_committed_snapshot_is_a_complete_pinned_record() -> None:
+    """Every field the pin needs is in the committed artifact, and consistent."""
+    snapshot = _pinned_snapshot_or_skip()
+    assert set(snapshot) == set(PIN_RECORD_FIELDS)
+    for field, expected in ISSUE_ONE_RESOLUTION.items():
+        assert snapshot[field] == expected, field
+    for list_field, size_field in (
+        ("corpus_unresolved", "corpus_unresolved_size"),
+        ("no_round_file_ids", "no_round_file_size"),
+        ("empty_prompt_ids", "empty_prompt_size"),
+        ("gold_unresolved", "gold_unresolved_size"),
+    ):
+        assert snapshot[list_field] == sorted(set(snapshot[list_field]))
+        assert snapshot[size_field] == len(snapshot[list_field])
+    assert set(snapshot["no_round_file_ids"]) | set(snapshot["empty_prompt_ids"]) == set(
+        snapshot["corpus_unresolved"]
+    )
+    assert set(snapshot["no_round_file_ids"]).isdisjoint(snapshot["empty_prompt_ids"])
+    assert snapshot["corpus_ids_sha256"] == bd.corpus_ids_sha256(
+        bd.artifact_ids()
+    )
+    bd.assert_anchors(snapshot)
+    bd.reproduce_snapshot(snapshot)
+
+
+def test_committed_snapshot_is_its_own_canonical_bytes() -> None:
+    snapshot = _pinned_snapshot_or_skip()
+    committed = Path(bd.DEFAULT_SNAPSHOT).read_bytes()
+    assert bd.snapshot_bytes(snapshot) == committed
+    elsewhere = Path(bd.DEFAULT_SNAPSHOT).with_name("s2.json")
+    assert bd.write_snapshot(snapshot, elsewhere).read_bytes() == committed
+    elsewhere.unlink()
+
+
+def test_c1_no_round_file_ledger_is_c2_frame_ledger() -> None:
+    """Two stages, one fact: the ids with no round file agree across artifacts.
+
+    C2's frame ledger and C1's resolution ledger were drawn from the same store
+    state, so the cross-check is what keeps either one from being edited quietly
+    -- the classification no artifact can otherwise show.
+    """
+    snapshot = _pinned_snapshot_or_skip()
+    manifest_path = bd.DEFAULT_DATASET_DIR / "base-rate-sample.json"
+    if not manifest_path.exists():
+        pytest.skip("C2 sample manifest not present")
+    c2 = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert sorted(snapshot["no_round_file_ids"]) == sorted(c2["missing_ids"])
+    # The extra id in C1's ledger is the empty-prompt row extension 3a covers.
+    assert set(snapshot["corpus_unresolved"]) - set(c2["missing_ids"]) == set(
+        snapshot["empty_prompt_ids"]
+    )
+
+
+def test_pinned_corpus_build_reproduces_the_committed_bytes() -> None:
+    """The whole point of U2, on the real data: the moved store re-draws nothing.
+
+    Rebuilding the corpus from the pinned ids and the pinned ledger, taking prompt
+    text from today's store, renders the exact committed bytes.
+    """
+    if not Path(bd.DEFAULT_ROUND_STORE).exists():
+        pytest.skip("round store not found")
+    snapshot = _pinned_snapshot_or_skip()
+    corpus = bd.corpus_records(
+        bd.artifact_ids(bd.DEFAULT_CORPUS_ARTIFACT),
+        bd.DEFAULT_ROUND_STORE,
+        snapshot["corpus_unresolved"],
+    )
+    rendered = bd.serialize_rows(bd.row_for(r) for r in corpus).encode("utf-8")
+    assert rendered == Path(bd.DEFAULT_CORPUS_ARTIFACT).read_bytes()
+
+
+def test_live_store_drift_is_named_and_leaves_the_corpus_pinned() -> None:
+    """The real moved store, asserted without asserting any live count.
+
+    What must hold on any store: nothing the snapshot claims is broken, whatever
+    differs is named by field, and the record still reproduces. The counts are
+    deliberately not asserted -- that was U2's disease.
+    """
+    if not Path(bd.DEFAULT_ROUND_STORE).exists():
+        pytest.skip("round store not found")
+    snapshot = _pinned_snapshot_or_skip()
+    report = bd.check_store_drift(
+        snapshot,
+        round_store=bd.DEFAULT_ROUND_STORE,
+        corpus_path=bd.DEFAULT_CORPUS_ARTIFACT,
+    )
+    assert report["lost_round_file_ids"] == []
+    assert report["prompt_text_mismatch_ids"] == []
+    assert set(report["drifted_fields"]) <= {
+        "corpus_unresolved",
+        "corpus_unresolved_size",
+        "corpus_resolved_size",
+        "no_round_file_ids",
+        "no_round_file_size",
+        "empty_prompt_ids",
+        "empty_prompt_size",
+    }
+    assert report["recorded_corpus_size"] == snapshot["corpus_size"] == 5430
+    assert report["live_unresolved_size"] == (
+        report["recorded_unresolved_size"]
+        - len(report["recovered_ids"])
+        + len(report["lost_round_file_ids"])
+    )
+    assert report["recorded_unresolved_size"] == 30
+    assert len(report["recovered_ids"]) <= 30
+    assert sorted(report["recovered_ids"]) == report["recovered_ids"]
+    assert set(report["recovered_ids"]) <= set(snapshot["corpus_unresolved"])
+
+
+# --- first divergence naming (the byte gate's message) ------------------------
+
+
+def test_first_divergent_field_handles_a_length_only_difference() -> None:
+    """A row that only grew has no differing byte inside the common prefix.
+
+    The byte gate calls this to describe its own refusal; an earlier version
+    walked a zip that never broke and crashed on an unbound offset instead.
+    """
+    short = json.dumps({"id": "ab" * 16, "bin": "other"}, sort_keys=True).encode() + b"\n"
+    long = short + b"extra\n"
+    assert "byte" in bd._first_divergent_field(short, long)
+    assert "byte" in bd._first_divergent_field(long, short)
+
+
+# --- CLI wiring of the pinned build ------------------------------------------
+
+
+def _cli_argv(fx: dict, monkeypatch=None) -> list[str]:
+    """The pinned build's CLI over the fixture.
+
+    ``assert_anchors`` is neutralised when a monkeypatch is supplied: the anchors
+    are the live 5430/242/30 numbers, and a 12-id fixture corpus can only ever
+    trip them. The anchor guard itself is asserted separately.
+    """
+    if monkeypatch is not None:
+        monkeypatch.setattr(bd, "assert_anchors", lambda snapshot: None)
+    return [
+        "--source", str(fx["source"]),
+        "--rounds-dir", str(fx["store"]),
+        "--out-dir", str(fx["dataset"]),
+        "--snapshot", str(fx["dataset"] / bd.SNAPSHOT_ARTIFACT),
+    ]
+
+
+def test_cli_pinned_build_reemits_the_same_bytes(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    fx = _pin_fixture(tmp_path)
+    before = {
+        name: path.read_bytes()
+        for name, path in (
+            ("gold", fx["gold_path"]),
+            ("corpus", fx["corpus_path"]),
+            ("snapshot", fx["snapshot_path"]),
+        )
+    }
+    assert bd.main(_cli_argv(fx, monkeypatch)) == 0
+    for name, path in (
+        ("gold", fx["gold_path"]),
+        ("corpus", fx["corpus_path"]),
+        ("snapshot", fx["snapshot_path"]),
+    ):
+        assert path.read_bytes() == before[name], name
+    out = capsys.readouterr().out
+    assert "source=pinned snapshot" in out
+    assert "store drift: none" in out
+
+
+def test_cli_pinned_build_survives_a_moved_store(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """The U2 disease, in a fixture: rounds come back, the artifacts do not move."""
+    fx = _pin_fixture(tmp_path)
+    for rid in PIN_LEDGER:
+        if rid not in set(PIN_UNUSABLE):
+            _write_round(fx["store"], rid, f"a recovered round {rid}")
+    for n in range(20):
+        _write_round(fx["store"], f"unrelated{n:03d}", "store growth")
+    before = {
+        name: path.read_bytes()
+        for name, path in (
+            ("gold", fx["gold_path"]),
+            ("corpus", fx["corpus_path"]),
+            ("snapshot", fx["snapshot_path"]),
+        )
+    }
+    assert bd.main(_cli_argv(fx, monkeypatch)) == 0
+    for name, path in (
+        ("gold", fx["gold_path"]),
+        ("corpus", fx["corpus_path"]),
+        ("snapshot", fx["snapshot_path"]),
+    ):
+        assert path.read_bytes() == before[name], name
+    out = capsys.readouterr().out
+    assert "the corpus was not re-drawn" in out
+    assert "recovered=3" in out
+
+
+def test_cli_refuses_to_redraw_a_pinned_snapshot(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    corpus_before = fx["corpus_path"].read_bytes()
+    with pytest.raises(SystemExit) as excinfo:
+        bd.main(_cli_argv(fx) + ["--redraw"])
+    assert "refuses to overwrite the pinned snapshot" in str(excinfo.value)
+    assert fx["corpus_path"].read_bytes() == corpus_before
+
+
+def test_cli_refuses_a_scan_snapshot_while_a_build_is_pinned(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    scan = _write_jsonl(tmp_path / "scan.jsonl", [{"id": rid} for rid in PIN_IDS])
+    with pytest.raises(SystemExit) as excinfo:
+        bd.main(_cli_argv(fx) + ["--scan-results", str(scan)])
+    assert "--scan-results" in str(excinfo.value)
+
+
+def test_cli_store_that_rewrote_recorded_text_fails_before_writing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The drift guard is the first line of defence: a rewritten prompt stops it."""
+    fx = _pin_fixture(tmp_path)
+    victim = next(i for i in PIN_IDS if i not in set(PIN_LEDGER))
+    _write_round(fx["store"], victim, f"prompt for {victim} (edited upstream)")
+    corpus_before = fx["corpus_path"].read_bytes()
+    gold_before = fx["gold_path"].read_bytes()
+    with pytest.raises(bd.StoreDriftError) as excinfo:
+        bd.main(_cli_argv(fx, monkeypatch))
+    assert "invalidates the pinned snapshot" in str(excinfo.value)
+    assert victim in str(excinfo.value)
+    assert fx["corpus_path"].read_bytes() == corpus_before
+    assert fx["gold_path"].read_bytes() == gold_before
+
+
+def test_cli_hand_edited_artifact_is_refused_by_the_byte_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A column the drift report does not cover is caught by the byte gate.
+
+    ``origin_id``/``origin_source`` come from store membership rather than from
+    prompt text, so an edited gold artifact is invisible to the drift check. The
+    gate is what refuses to overwrite it with the build's own rendering, naming
+    the row it would have rewritten.
+    """
+    fx = _pin_fixture(tmp_path)
+    corpus_before = fx["corpus_path"].read_bytes()
+    _rewrite_record_artifact(
+        fx["gold_path"],
+        lambda rows: rows[0].update(origin_source=bd.ORIGIN_IN_SET),
+    )
+    gold_before = fx["gold_path"].read_bytes()
+    with pytest.raises(SystemExit) as excinfo:
+        bd.main(_cli_argv(fx, monkeypatch))
+    message = str(excinfo.value)
+    assert "would change" in message and bd.GOLD_ARTIFACT in message
+    assert "the recorded snapshot no longer matches its own bytes" in message
+    assert fx["corpus_path"].read_bytes() == corpus_before
+    assert fx["gold_path"].read_bytes() == gold_before
+
+
+def test_cli_pinned_build_needs_the_artifacts_it_records(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    empty = tmp_path / "empty-dataset"
+    empty.mkdir()
+    shutil.copy(fx["snapshot_path"], empty / bd.SNAPSHOT_ARTIFACT)
+    with pytest.raises(SystemExit) as excinfo:
+        bd.main(
+            [
+                "--source", str(fx["source"]),
+                "--rounds-dir", str(fx["store"]),
+                "--out-dir", str(empty),
+                "--snapshot", str(empty / bd.SNAPSHOT_ARTIFACT),
+            ]
+        )
+    assert "a pinned build reproduces them, it does not create them" in str(excinfo.value)
+
+
+def test_cli_fresh_draw_records_a_snapshot(tmp_path: Path, monkeypatch) -> None:
+    """No snapshot pinned: the store decides, and the build records what it saw."""
+    fx = _pin_fixture(tmp_path)
+    scan = _write_jsonl(tmp_path / "scan.jsonl", [{"id": rid} for rid in PIN_IDS])
+    out = tmp_path / "fresh"
+    out.mkdir()
+    snapshot_path = out / bd.SNAPSHOT_ARTIFACT
+    argv = [
+        "--source", str(fx["source"]),
+        "--scan-results", str(scan),
+        "--rounds-dir", str(fx["store"]),
+        "--out-dir", str(out),
+        "--snapshot", str(snapshot_path),
+    ]
+    assert bd.main(argv) == 0
+    recorded = bd.load_snapshot(snapshot_path)
+    assert recorded["corpus_unresolved"] == PIN_LEDGER
+    assert recorded["no_round_file_ids"] == PIN_NO_FILE
+    assert recorded["empty_prompt_ids"] == PIN_UNUSABLE
+    assert recorded["corpus_ids_sha256"] == bd.corpus_ids_sha256(PIN_IDS)
+    # A second run is now the pinned run, and reproduces byte-for-byte.
+    corpus_before = (out / bd.CORPUS_ARTIFACT).read_bytes()
+    monkeypatch.setattr(bd, "assert_anchors", lambda snapshot: None)
+    pinned_argv = _cli_argv(
+        {"source": fx["source"], "store": fx["store"], "dataset": out}, monkeypatch
+    )
+    assert bd.main(pinned_argv) == 0
+    assert (out / bd.CORPUS_ARTIFACT).read_bytes() == corpus_before
+
+
+def test_cli_fresh_draw_without_an_id_source_fails_loudly(tmp_path: Path) -> None:
+    fx = _pin_fixture(tmp_path)
+    out = tmp_path / "fresh2"
+    out.mkdir()
+    with pytest.raises(SystemExit) as excinfo:
+        bd.main(
+            [
+                "--source", str(fx["source"]),
+                "--scan-results", str(tmp_path / "no-scan.jsonl"),
+                "--rounds-dir", str(fx["store"]),
+                "--out-dir", str(out),
+                "--snapshot", str(out / bd.SNAPSHOT_ARTIFACT),
+            ]
+        )
+    assert "no id universe to build the corpus from" in str(excinfo.value)
+
+
+def test_cli_gold_that_lost_a_round_file_fails_before_writing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A gold row the record says is resolved must stay re-derivable."""
+    fx = _pin_fixture(tmp_path)
+    (fx["store"] / f"{PIN_GOLD[0]}.json").unlink()
+    gold_before = fx["gold_path"].read_bytes()
+    with pytest.raises(bd.StoreDriftError):
+        bd.main(_cli_argv(fx, monkeypatch))
+    assert fx["gold_path"].read_bytes() == gold_before
