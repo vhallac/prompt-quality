@@ -4,6 +4,7 @@ One indexed line per decision. Newest at the top.
 
 ## Source resolution
 
+- 016 — Pinned external reference copies: commit the bytes or the facts, never the citation — accepted
 - 015 — Source path resolution: sibling checkout default + env override — accepted
 
 ## Training methodology
