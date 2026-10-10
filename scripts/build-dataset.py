@@ -103,7 +103,8 @@ DEFAULT_SNAPSHOT = Path(
     )
 )
 
-# Ids dropped by the C1 Q2 decision (see .todo/findings.md and issue #1).
+# Ids dropped by the C1 Q2 decision (issue #1; both are recorded in the pinned
+# ledger `dataset/c1-build-snapshot.json`).
 DROP_IDS = frozenset(
     {
         "83ebde302dd2fa4d00bed2a1a65b39f5",  # no-fault-within-round
