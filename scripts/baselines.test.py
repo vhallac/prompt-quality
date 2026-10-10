@@ -1,5 +1,7 @@
 """C3 baseline tests: metrics core + gold loader + lexical baselines."""
 
+import ast
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -25,6 +27,8 @@ from baselines import (
     JEV_CACHE_QUESTIONS_KEY,
     JEV_QUESTIONS,
     JEV_QUESTIONS_SHA256,
+    JEV_REFERENCE_PATH,
+    JEV_REFERENCE_SHA256,
     JEV_VARIANTS,
     RESPONSE_MARKER,
     alarm_rate,
@@ -48,12 +52,14 @@ from baselines import (
     jev_flag_score,
     jev_legacy_adoption_allowed,
     jev_questions_sha256,
+    jev_reference_identity,
     length_feature,
     lexical_features,
     load_corpus_base_rate,
     load_gold,
     load_gold_status_ids,
     load_jev_cache,
+    load_jev_reference,
     logistic_score,
     main,
     operating_points,
@@ -62,6 +68,7 @@ from baselines import (
     parent_response_state,
     prompt_only_state,
     JevCacheError,
+    JevReferenceError,
     own_response_state,
     query_jev,
     rescore_rows,
@@ -461,6 +468,12 @@ def test_prompt_only_state_uses_constant_marker():
     s2 = prompt_only_state("Fix the bug very differently.")
     assert s1 == "USER PROMPT:\nFix the bug.\n\nASSISTANT RESPONSE:\n[not shown]"
     assert RESPONSE_MARKER in s1
+    # prompt-only is the reference's own state with the response slot replaced:
+    # same builder, marker instead of a response.
+    assert s1 == REF.build_state(
+        {"userPrompt": "Fix the bug.", "responseSequence": RESPONSE_MARKER},
+        baselines.JEV_STATE_CHARS,
+    )
     # the state is a function of the prompt alone: different rounds with the
     # same prompt but different responses produce the same state
     own = own_response_state("Fix the bug.", _round_file("a" * 32, "Fix the bug.", "response A"))
@@ -469,14 +482,22 @@ def test_prompt_only_state_uses_constant_marker():
 
 
 def test_own_response_state_matches_jev_round_scan_shape():
+    """Parity with the pinned reference, not with a local string literal (F3).
+
+    The shape sweep over response types lives in
+    ``test_pinned_reference_build_state_parity``; what this test keeps is the
+    original claim, now anchored on the reference's own output.
+    """
     data = _round_file("a" * 32, "Fix the bug.", "the fix is here")
-    assert (
-        own_response_state("Fix the bug.", data)
-        == "USER PROMPT:\nFix the bug.\n\nASSISTANT RESPONSE:\nthe fix is here"
+    assert own_response_state("Fix the bug.", data) == REF.build_state(
+        data, baselines.JEV_STATE_CHARS
     )
     # string-typed responseSequence (the current store shape) is used verbatim
     data_str = dict(data, responseSequence="plain string response")
-    assert own_response_state("q", data_str).endswith("plain string response")
+    assert own_response_state("Fix the bug.", data_str) == REF.build_state(
+        data_str, baselines.JEV_STATE_CHARS
+    )
+    assert own_response_state("Fix the bug.", data_str).endswith("plain string response")
 
 
 def test_parent_response_state_redacts_tool_calls():
@@ -491,6 +512,8 @@ def test_parent_response_state_redacts_tool_calls():
     assert s.startswith("USER PROMPT:\nFix the bug.\n\nPREVIOUS ROUND RESPONSE")
     assert "first text" in s and "second text" in s
     assert "[1 tool calls in the parent response were redacted]" in s
+    # byte equality with the reference for this shape is asserted in
+    # test_pinned_reference_build_refine_state_parity
 
 
 def test_parent_response_state_truncates_to_state_chars():
@@ -1449,3 +1472,174 @@ class TestJevCacheCrashSafety:
         monkeypatch.setattr(baselines, "load_gold_status_ids", lambda p: ([], []))
         monkeypatch.setattr(baselines, "load_corpus_base_rate", lambda p=1: 0.25)
         return store, path, cache
+
+
+# ---------------------------------------------------------------------------
+# F3: the pinned reference scorer (scripts/reference/jev-round-scan.py)
+# ---------------------------------------------------------------------------
+#
+# The C3 jev harness copies four things from the external scorer: the question
+# set, the model id, the state-char limit, and the two state builders. Before
+# F3 that parity was asserted with local string literals, so "re-runs the jev
+# round-scan scorer" could only be checked by someone holding a sibling semblr
+# checkout. Everything below reads the pinned copy instead, so the claim is
+# checkable from a clean clone of this repository alone.
+
+REF = load_jev_reference()
+
+# The reference file as pinned: semblr scripts/jev-round-scan.py at ba10970,
+# 375 lines, digest verified against that checkout on 2026-10-09.
+REFERENCE_SHA256 = (
+    "4e294839a341c953d38dba17dadfd87be53d36f536700d3274da16f387bf8704"
+)
+
+
+def _reference_state_chars_limit() -> int:
+    """The --state-chars default the pinned reference parses from its own CLI."""
+    tree = ast.parse(JEV_REFERENCE_PATH.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "add_argument"
+        ):
+            continue
+        if node.args and getattr(node.args[0], "value", None) == "--state-chars":
+            for kw in node.keywords:
+                if kw.arg == "default":
+                    return kw.value.value
+    raise AssertionError("--state-chars default not found in the pinned reference")
+
+
+def test_pinned_reference_copy_matches_its_recorded_digest():
+    """The checked-in copy is byte-identical to the reference it pins."""
+    assert JEV_REFERENCE_PATH.is_file(), JEV_REFERENCE_PATH
+    digest = hashlib.sha256(JEV_REFERENCE_PATH.read_bytes()).hexdigest()
+    assert digest == REFERENCE_SHA256 == JEV_REFERENCE_SHA256
+
+
+def test_pinned_reference_questions_are_the_jev_payload():
+    assert REF.QUESTIONS == JEV_QUESTIONS
+    assert jev_questions_sha256(REF.QUESTIONS) == JEV_QUESTIONS_SHA256
+
+
+def test_pinned_reference_model_endpoint_and_state_limit():
+    assert REF.MODEL == baselines.JEV_MODEL
+    assert REF.DECISIONS_URL == baselines.JEV_DECISIONS_URL
+    assert baselines.JEV_STATE_CHARS == _reference_state_chars_limit()
+
+
+@pytest.mark.parametrize(
+    "response_sequence",
+    [
+        "plain string response",
+        [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+        [{"type": "toolCall", "tool": "bash"}],
+        [{"text": "no type key"}],
+        ["bare string segment"],
+        [],
+        None,
+    ],
+)
+def test_pinned_reference_build_state_parity(response_sequence):
+    """own_response_state and the reference build_state yield the same state."""
+    data = _round_file("a" * 32, "Fix the bug.", response_sequence)
+    assert own_response_state("Fix the bug.", data) == REF.build_state(
+        data, baselines.JEV_STATE_CHARS
+    )
+
+
+def test_pinned_reference_build_state_truncates_at_the_same_limit():
+    long = "x" * (baselines.JEV_STATE_CHARS + 500)
+    data = _round_file("a" * 32, "Fix the bug.", long)
+    mine, theirs = (
+        own_response_state("Fix the bug.", data),
+        REF.build_state(data, baselines.JEV_STATE_CHARS),
+    )
+    assert mine == theirs
+    assert len(mine) == len(theirs) == baselines.JEV_STATE_CHARS
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [{"type": "text", "text": "only text"}],
+        [
+            {"type": "text", "text": "first text"},
+            {"type": "toolCall", "tool": "bash"},
+            {"type": "text", "text": "second text"},
+        ],
+        [{"type": "toolCall"}, {"type": "toolCall"}],
+        [],
+        [{"type": "text", "text": "x" * (baselines.JEV_STATE_CHARS + 500)}],
+    ],
+)
+def test_pinned_reference_build_refine_state_parity(segments):
+    """parent_response_state matches the reference build_refine_state."""
+    parent = {"responseSegments": segments}
+    child = _round_file("b" * 32, "continue", "child response")
+    assert parent_response_state("continue", parent) == REF.build_refine_state(
+        child, parent, baselines.JEV_STATE_CHARS
+    )
+
+
+def test_pinned_reference_absent_copy_fails_the_build_loudly(tmp_path):
+    """No pinned copy is a build error, not an artifact with an unverifiable claim."""
+    missing = tmp_path / "jev-round-scan.py"
+    assert not missing.exists()
+    # both seams fail with the path in the message, not a bare traceback
+    with pytest.raises(JevReferenceError, match=re.escape(str(missing))):
+        jev_reference_identity(missing)
+    with pytest.raises(JevReferenceError, match="not found"):
+        load_jev_reference(missing)
+
+
+def test_pinned_reference_tampering_is_named_not_published(tmp_path):
+    """A byte change to the pinned copy fails, naming path and both digests."""
+    edited = tmp_path / "jev-round-scan.py"
+    edited.write_bytes(JEV_REFERENCE_PATH.read_bytes() + b"\n# reworded\n")
+    with pytest.raises(JevReferenceError) as excinfo:
+        jev_reference_identity(edited)
+    message = str(excinfo.value)
+    assert str(edited) in message
+    assert JEV_REFERENCE_SHA256 in message
+    assert hashlib.sha256(edited.read_bytes()).hexdigest() in message
+
+
+def test_metrics_inputs_records_the_pinned_reference(tmp_path):
+    """inputs.jev_reference names the copy the parity claim rests on."""
+    rows = _report_rows()
+    store = _report_rounds(tmp_path, rows)
+    metrics, _ = assemble_baselines(
+        rows, 0.2, {}, query_fn=_report_query, round_store=store
+    )
+    ref = metrics["inputs"]["jev_reference"]
+    assert ref["sha256"] == REFERENCE_SHA256
+    assert ref["path"] == "scripts/reference/jev-round-scan.py"
+    assert ref["upstream"] == baselines.JEV_REFERENCE_UPSTREAM
+    # the questions digest is recorded once (under jev); the pin points at that
+    # field, and the pointer has to resolve — a renamed field is a rotting
+    # citation, which is what F3 is about
+    node = metrics
+    for part in ref["questions_sha256_field"].split("."):
+        node = node[part]
+    assert node == jev_questions_sha256(REF.QUESTIONS) == JEV_QUESTIONS_SHA256
+
+
+def test_metrics_inputs_records_the_copy_it_was_given(tmp_path):
+    """The reference seam records the bytes actually used, wherever they live."""
+    rows = _report_rows()
+    store = _report_rounds(tmp_path, rows)
+    other = tmp_path / "copies" / "jev-round-scan.py"
+    other.parent.mkdir()
+    other.write_bytes(JEV_REFERENCE_PATH.read_bytes())
+    metrics, _ = assemble_baselines(
+        rows,
+        0.2,
+        {},
+        query_fn=_report_query,
+        round_store=store,
+        reference_path=other,
+    )
+    recorded = metrics["inputs"]["jev_reference"]
+    assert recorded["sha256"] == REFERENCE_SHA256
+    assert recorded["path"] == str(other)

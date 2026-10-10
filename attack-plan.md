@@ -4,6 +4,16 @@
 
 Pipeline = `jev-round-scan.py` → `fault-pipeline.py`, with `jev-chain-fault.py` as a side tool.
 
+The scan-stage scorer is pinned in this repository at
+`scripts/reference/jev-round-scan.py` — a byte-for-byte copy of semblr's
+`scripts/jev-round-scan.py` at commit `ba10970`, sha256
+`4e294839a341c953d38dba17dadfd87be53d36f536700d3274da16f387bf8704`. Line
+citations below are to that pinned copy (`build_state` 78–92,
+`build_refine_state` 154–173, `QUESTIONS` 46–76, `MODEL` 44, `--state-chars`
+default 272), so they resolve from a clean clone. `baseline-metrics.json`'s
+`inputs.jev_reference` records the same digest, and `scripts/baselines.test.py`
+asserts C3's copies against this file.
+
 1. **Scan (weak supervision).** `jev-round-scan.py` scores all 5430 scanned rounds on
    (a) user frustration 0–4 and (b) correction-of-round-discovery-failure probability.
    Thresholds trip → examination bin. Refine pass rebuilds state from the prompt +
@@ -34,7 +44,8 @@ Pipeline = `jev-round-scan.py` → `fault-pipeline.py`, with `jev-chain-fault.py
    (fault bins are positives; no-fault and external are negatives; ambiguous excluded).
    Weak labels = jev-scan frustration/correction scores.
 2. **Known leak.** `jev-round-scan.py` passes the round's **own** response to the
-   scorer (`build_state`); only `--refine` (`build_refine_state`) uses the **parent**
+   scorer (`build_state`, `scripts/reference/jev-round-scan.py:78-92`); only
+   `--refine` (`build_refine_state`, `:154-173`) uses the **parent**
    response. A prompt-only re-score strips that context. Measure both deltas:
    **leak delta** = `AUC(prompt+own-response) − AUC(prompt-only)` — how much the scorer
    leans on the response it is judging, the headline "context value"; and **session

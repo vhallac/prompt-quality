@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -413,10 +414,29 @@ def logistic_score(weights: list[float], x: list[float]) -> float:
 # ---------------------------------------------------------------------------
 # Baseline (c): jev re-score harness (unit-003)
 # ---------------------------------------------------------------------------
+#
+# The constants and state builders below are *copies* of the external jev
+# round-scan scorer's, so they need an in-repo authority to be checked
+# against. That authority is the pinned reference copy: byte-identical to
+# ``semblr scripts/jev-round-scan.py`` at commit ``ba10970``, committed here
+# so the parity claim resolves from a clean clone with no sibling checkout
+# (review F3; the same convention C2 uses for its scan snapshot).
+#
+# Comments below cite that copy as ``reference:NN``. Line numbers are safe to
+# cite here — the bytes are pinned, so a re-serialised reference changes its
+# digest and ``jev_reference_identity`` fails the run naming the path.
 
-JEV_MODEL = "typesafe/jev-1.13"
-JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
-JEV_STATE_CHARS = 12000  # jev-round-scan.py default --state-chars
+JEV_REFERENCE_PATH = (
+    Path(__file__).resolve().parent / "reference" / "jev-round-scan.py"
+)
+JEV_REFERENCE_SHA256 = (
+    "4e294839a341c953d38dba17dadfd87be53d36f536700d3274da16f387bf8704"
+)
+JEV_REFERENCE_UPSTREAM = "semblr scripts/jev-round-scan.py at ba10970"
+
+JEV_MODEL = "typesafe/jev-1.13"  # reference:44 (MODEL)
+JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"  # reference:43
+JEV_STATE_CHARS = 12000  # reference:272 (--state-chars default)
 ROUND_STORE = Path(
     os.environ.get(
         "PROMPT_QUALITY_ROUND_STORE",
@@ -434,7 +454,8 @@ JEV_MAX_RETRIES = 3
 RESPONSE_MARKER = "[not shown]"
 
 # The question set of jev-round-scan.py (verbatim: the old wording that
-# separated clean vs positive in the phase-1 probes).
+# separated clean vs positive in the phase-1 probes) — reference:46-76
+# (QUESTIONS), byte-compared by the parity tests.
 JEV_QUESTIONS = {
     "frustration": {
         "type": "score",
@@ -482,6 +503,68 @@ def jev_questions_sha256(questions: dict | None = None) -> str:
 
 JEV_QUESTIONS_SHA256 = jev_questions_sha256()
 
+
+class JevReferenceError(RuntimeError):
+    """The pinned jev reference scorer is missing or no longer the pinned bytes.
+
+    Raised with the path in the message (review F3): the point of pinning is
+    that an edit to the reference — or to this stage's copies of it — stops
+    the run instead of silently leaving "re-runs the jev round-scan scorer"
+    false.
+    """
+
+
+def load_jev_reference(path: str | Path = JEV_REFERENCE_PATH):
+    """Import the pinned reference scorer as a module.
+
+    The copy is stdlib-only at module level and its ``main()`` sits behind an
+    ``if __name__ == "__main__"`` guard, so importing it has no side effects
+    and no dependency on the sibling checkout. Used by the parity tests; the
+    stage itself keeps its own copies of the constants (decision 013).
+    """
+    ref_path = Path(path)
+    if not ref_path.is_file():
+        raise JevReferenceError(f"pinned jev reference scorer not found: {ref_path}")
+    spec = importlib.util.spec_from_file_location("jev_reference_scan", ref_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def jev_reference_identity(path: str | Path = JEV_REFERENCE_PATH) -> dict:
+    """The pinned reference scorer's identity, for ``metrics.inputs``.
+
+    Hashes the pinned bytes and refuses to publish them unless they still
+    match ``JEV_REFERENCE_SHA256``. The questions digest is *not* duplicated
+    here: it is published once as ``jev.questions_sha256`` (unit-005) and also
+    keys the cache (decision 008), so this block points at that field.
+    """
+    ref_path = Path(path)
+    try:
+        digest = hashlib.sha256(ref_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise JevReferenceError(
+            f"cannot read the pinned jev reference scorer: {exc}"
+        ) from exc
+    if digest != JEV_REFERENCE_SHA256:
+        raise JevReferenceError(
+            f"pinned jev reference scorer changed: {ref_path} is {digest}, "
+            f"expected {JEV_REFERENCE_SHA256} ({JEV_REFERENCE_UPSTREAM})"
+        )
+    try:
+        recorded = str(
+            ref_path.resolve().relative_to(Path(__file__).resolve().parent.parent)
+        )
+    except ValueError:
+        recorded = str(ref_path)
+    return {
+        "path": recorded,
+        "sha256": digest,
+        "upstream": JEV_REFERENCE_UPSTREAM,
+        "questions_sha256_field": "jev.questions_sha256",
+    }
+
+
 # The shipped jev cache predates questions-keyed entries, so its file records
 # no digest of its own. The question set that produced it is a fact of git
 # history: JEV_QUESTIONS was introduced at 6635d82 and has not been edited in
@@ -513,8 +596,8 @@ class JevCacheError(RuntimeError):
 
 def _own_response_text(round_data: dict) -> str:
     """Own-response text as jev-round-scan.py's build_state extracts it
-    (responseSequence is a plain string in current round files, but the
-    segment-list shape is mirrored for older files)."""
+    (reference:80-90) — responseSequence is a plain string in current round
+    files, but the segment-list shape is mirrored for older files."""
     seq = round_data.get("responseSequence")
     if isinstance(seq, str):
         return seq
@@ -534,7 +617,8 @@ def prompt_only_state(prompt: str) -> str:
 
 def own_response_state(prompt: str, round_data: dict) -> str:
     """State identical in shape to jev-round-scan.py's build_state output
-    (the leak the scan pass already carries)."""
+    (reference:78-92; asserted against it by the parity tests) — the leak the
+    scan pass already carries."""
     combined = (
         f"USER PROMPT:\n{prompt}\n\n"
         f"ASSISTANT RESPONSE:\n{_own_response_text(round_data)}"
@@ -543,8 +627,9 @@ def own_response_state(prompt: str, round_data: dict) -> str:
 
 
 def parent_response_state(prompt: str, parent_data: dict) -> str:
-    """State in the shape of jev-round-scan.py's build_refine_state: the
-    prompt plus the parent round's response with tool calls redacted."""
+    """State in the shape of jev-round-scan.py's build_refine_state
+    (reference:154-173): the prompt plus the parent round's response with tool
+    calls redacted."""
     texts = []
     n_tools = 0
     for seg in parent_data.get("responseSegments") or []:
@@ -581,8 +666,8 @@ def query_jev(
     url: str = JEV_DECISIONS_URL,
 ) -> dict:
     """One decisions-API call, in the shape of jev-round-scan.py's
-    query_jev. Raises on network/HTTP errors or an unexpected response
-    shape (the caller applies the retry/exclusion policy).
+    query_jev (reference:95-114). Raises on network/HTTP errors or an
+    unexpected response shape (the caller applies the retry/exclusion policy).
 
     Raises without touching the network when no key is configured: a cache
     miss then says "no API key" once instead of recording every row as an
@@ -1284,12 +1369,17 @@ def assemble_baselines(
     unresolved_ids: list[str] | None = None,
     n_boot: int = BOOTSTRAP_N,
     seed: int = BOOTSTRAP_SEED,
+    reference_path: str | Path = JEV_REFERENCE_PATH,
 ) -> tuple[dict, list[dict]]:
     """Assemble the metrics document and per-row score dump.
 
     Pure with respect to disk except for ``cache``, which ``rescore_rows``
     fills in place; the caller persists it. With a warm cache the call is
-    offline and deterministic (extension 7a).
+    offline and deterministic (extension 7a). The only other read is the
+    pinned jev reference scorer, whose bytes are hashed into ``inputs`` so the
+    artifact names the reference it claims parity with (review F3); a tampered
+    or missing copy raises ``JevReferenceError`` rather than emitting numbers
+    under a false claim.
     """
     labels = _labels_of(rows)
     lexical_scores, combiner = combined_lexical_scores(rows)
@@ -1368,6 +1458,7 @@ def assemble_baselines(
             "gold": str(GOLD_PATH),
             "base_rate_results": str(BASE_RATE_RESULTS_PATH),
             "round_store": str(round_store),
+            "jev_reference": jev_reference_identity(reference_path),
         },
         "gold": {
             "scored_rows": len(rows),

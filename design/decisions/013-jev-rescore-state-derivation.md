@@ -20,6 +20,12 @@ The question wording and clipping logic must mirror the original scanner exactly
 
 All three clip the final state to `JEV_STATE_CHARS = 12000` characters, matching the original scanner's limit. The questions are copied verbatim from `jev-round-scan.py`. The model is `typesafe/jev-1.13`. The score is `max(correction_p, frustration / 4)` — monotone with the scan's OR-flag rule (`fr >= 3 or corr >= 0.7 ⇒ score >= 0.7`).
 
+"Matching the original" is checked, not asserted: the reference scorer is pinned
+in this repository at `scripts/reference/jev-round-scan.py` (a byte-for-byte copy
+of semblr's file at `ba10970`), `baseline-metrics.json` records its digest under
+`inputs.jev_reference`, and `scripts/baselines.test.py` compares the questions,
+model, endpoint, state limit and both builders against that copy.
+
 ## Consequences
 - The three variants are comparable: only the response context changes; the clipping, questions, model, and scoring rule are identical.
 - "Leak delta" (own-response AUC − prompt-only AUC) and "session delta" (parent-response AUC − prompt-only AUC) are reported on exactly the paired rows where both variants have valid scores.

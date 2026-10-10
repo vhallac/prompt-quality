@@ -5,6 +5,13 @@
 ## Context
 The prompt-quality project depends on inputs from the sibling semblr checkout: `semblr/temp/fault-pipeline.jsonl` (fault adjudication results), `semblr/temp/jev-scan-results.jsonl` (scan snapshot), `semblr/scripts/fault-pipeline.py` (S2 machinery), `semblr/scripts/jev-round-scan.py` (JEV scorer), and the round store (`~/.pi/agent/semblr/rounds/`). The plan and issues refer to paths under `semblr/`, but this repo has no `semblr/` directory — the real source is the sibling checkout at `../semblr/`.
 
+Two of those inputs are claims this repository makes about *behaviour*, not just
+data, so they no longer resolve to the sibling checkout: the scan snapshot is
+committed as `dataset/prompt-corpus.jsonl` (C2) and the JEV scorer is pinned as
+`scripts/reference/jev-round-scan.py` (C3, review F3). What still lives only in
+`../semblr/` is `fault-pipeline.py` (imported for its S2 machinery) and the round
+store.
+
 Hard-coding `../semblr/` assumes a specific directory layout. Environment variables allow the paths to be overridden without editing code — useful for CI, vendoring, or a different checkout name.
 
 ## Decision
@@ -21,6 +28,9 @@ The round store path is also configurable: `~/.pi/agent/semblr/rounds` by defaul
 
 ## Consequences
 - Scripts are runnable from any directory layout without editing source.
+- A pinned copy inside this repository (corpus, jev reference scorer) is readable
+  with no sibling checkout at all, which is what makes C3's parity claim
+  checkable from a clean clone.
 - A missing sibling checkout is detected at import/resolution time with a clear error, not a confusing `FileNotFoundError` deep in the code.
 - The env-var overrides are documented in each script's `--help` and in the attack plan as-needed.
 - No script hard-codes a bare `../semblr/` string; all go through a configurable default function.
