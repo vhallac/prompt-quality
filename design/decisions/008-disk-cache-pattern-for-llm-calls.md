@@ -22,5 +22,5 @@ Both C2 (base-rate S2 adjudication) and C3 (jev re-score) make paid LLM API call
 - Cache files can grow large (C3's jev cache reached 564 entries); the sorted-JSON format is simple and inspectable, not optimized for size.
 - Cache invalidation is implicit and complete: any change to model, state, or rubric produces a different hash → cache miss → fresh API call. No stale answer can be served under a key it does not belong to.
 - Per-row persistence (see 007) means an interrupted run keeps all prior entries; atomic write means an interrupted *save* keeps them too.
-- Re-keying an existing paid cache is a one-time, self-authorized operation gated on a pinned digest, so fixing the key does not force re-billing (the 564-entry jev cache survived F2's fix with zero API calls — see `docs/pr9-fix-report.md`).
+- Re-keying an existing paid cache is a one-time, self-authorized operation gated on a pinned digest, so fixing the key does not force re-billing (the 564-entry jev cache survived F2's fix with zero API calls; the finding-by-finding evidence is the remediation report on PR `vhallac/prompt-quality#9`).
 - C2's `(system, user, model)` key already satisfied the rule; C3's `(state, model)` key is the case that motivated restating it, because it omitted a field the stage reads from source rather than from the CLI.
