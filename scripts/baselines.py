@@ -1357,6 +1357,52 @@ def _score_rows(
     return out
 
 
+def input_display_path(path: str | Path) -> str:
+    """How a committed artifact names one of its input locations.
+
+    An absolute path under the home directory is recorded relative to it
+    (``~/.pi/agent/semblr/rounds``), so the artifact says the same thing on every
+    box that keeps the convention (decision 015) and a re-emit is byte-identical
+    off this machine. Anything else — a path outside home, a relative path, a
+    ``--round-store`` override — is recorded verbatim: it is not the convention,
+    so the artifact must name what was actually read rather than pretend.
+    Overriding the location is the ``PROMPT_QUALITY_ROUND_STORE`` variable's job,
+    not this field's.
+    """
+    raw = str(path)
+    resolved = Path(raw).expanduser()
+    if not resolved.is_absolute():
+        return raw
+    home = Path.home()
+    if resolved == home:
+        return "~"
+    try:
+        return "~/" + str(resolved.relative_to(home))
+    except ValueError:
+        return raw
+
+
+def gold_content_sha256(rows: Sequence[dict]) -> str:
+    """Digest of the gold rows this run scored (id, label, prompt).
+
+    The artifact names the file it read, but a file name does not pin its
+    content: C1 owns the gold and can re-emit it with a different label split or
+    different prompt text, and every number in this artifact would move with it.
+    Hashing the rows actually loaded — not the bytes on disk — keeps the claim
+    true for whatever the caller passed in, and needs no second read of a file
+    that may not exist on a data-less clone.
+
+    Rows are sorted by id and rendered with sorted keys, so the digest is a
+    property of the set, not of load order.
+    """
+    payload = sorted(
+        ((r["id"], r["label"], r["prompt"]) for r in rows),
+        key=lambda entry: entry[0],
+    )
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def assemble_baselines(
     rows: list[dict],
     corpus_base_rate: float,
@@ -1370,16 +1416,25 @@ def assemble_baselines(
     n_boot: int = BOOTSTRAP_N,
     seed: int = BOOTSTRAP_SEED,
     reference_path: str | Path = JEV_REFERENCE_PATH,
+    gold_path: str | Path = GOLD_PATH,
+    base_rate_results_path: str | Path = BASE_RATE_RESULTS_PATH,
 ) -> tuple[dict, list[dict]]:
     """Assemble the metrics document and per-row score dump.
 
-    Pure with respect to disk except for ``cache``, which ``rescore_rows``
-    fills in place; the caller persists it. With a warm cache the call is
-    offline and deterministic (extension 7a). The only other read is the
-    pinned jev reference scorer, whose bytes are hashed into ``inputs`` so the
-    artifact names the reference it claims parity with (review F3); a tampered
-    or missing copy raises ``JevReferenceError`` rather than emitting numbers
-    under a false claim.
+    Reads only what its inputs name: the round store (for the jev states,
+    which is why the run is deterministic once the cache holds those states),
+    the warm ``cache`` — which ``rescore_rows`` fills in place and the caller
+    persists — and the pinned jev reference scorer, whose bytes are hashed into
+    ``inputs`` so the artifact names the reference it claims parity with (review
+    F3); a tampered or missing copy raises ``JevReferenceError`` rather than
+    emitting numbers under a false claim.
+
+    ``inputs`` is the artifact's own provenance block, so every field in it is
+    something a re-run can reproduce: the gold by a digest of the rows scored
+    (``gold_sha256``), the round store by a home-relative display path
+    (``input_display_path``). Neither the row contents nor a machine username
+    leak into any metric, but both would otherwise make a committed artifact
+    re-emit differently somewhere else.
     """
     labels = _labels_of(rows)
     lexical_scores, combiner = combined_lexical_scores(rows)
@@ -1455,9 +1510,10 @@ def assemble_baselines(
         "n_boot": n_boot,
         "corpus_base_rate_target": corpus_base_rate,
         "inputs": {
-            "gold": str(GOLD_PATH),
-            "base_rate_results": str(BASE_RATE_RESULTS_PATH),
-            "round_store": str(round_store),
+            "gold": str(gold_path),
+            "gold_sha256": gold_content_sha256(rows),
+            "base_rate_results": str(base_rate_results_path),
+            "round_store": input_display_path(round_store),
             "jev_reference": jev_reference_identity(reference_path),
         },
         "gold": {
@@ -1610,6 +1666,8 @@ def main(argv: list[str] | None = None) -> int:
         round_store=args.round_store,
         excluded_ids=excluded_ids,
         unresolved_ids=unresolved_ids,
+        gold_path=args.gold,
+        base_rate_results_path=args.base_rate_results,
     )
     # Artifacts first, cache second: a run the determinism gate rejects must
     # not have rewritten a tracked artifact already (review F8).

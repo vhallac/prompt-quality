@@ -12,7 +12,11 @@ citations below are to that pinned copy (`build_state` 78–92,
 `build_refine_state` 154–173, `QUESTIONS` 46–76, `MODEL` 44, `--state-chars`
 default 272), so they resolve from a clean clone. `baseline-metrics.json`'s
 `inputs.jev_reference` records the same digest, and `scripts/baselines.test.py`
-asserts C3's copies against this file.
+asserts C3's copies against this file. The rest of `inputs` names its locations
+the same way: `gold_sha256` is the digest of the gold rows scored, and the round
+store is recorded home-relative (`~/.pi/agent/semblr/rounds`) — never a
+machine-absolute path, which would make a committed artifact re-emit differently
+somewhere else.
 
 1. **Scan (weak supervision).** `jev-round-scan.py` scores all 5430 scanned rounds on
    (a) user frustration 0–4 and (b) correction-of-round-discovery-failure probability.

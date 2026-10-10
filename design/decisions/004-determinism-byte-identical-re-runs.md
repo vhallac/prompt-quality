@@ -14,6 +14,13 @@ Reproducibility is a first-class requirement (from AGENTS.md): re-running the sa
 
 For stages with live API calls (C2, C3), the disk cache (see 008) makes the re-run deterministic: warm cache → no API calls → byte-identical output.
 
+Determinism also needs the artifact to *name* the inputs it re-derives from, in
+a form a re-run can reproduce. C3's `inputs` therefore records `gold_sha256` — a
+digest of the gold rows scored (id, label, prompt), not a file path — and every
+location home-relative. A path names a moving file; the digest states which bytes
+the published numbers came from, and the fields that must not move (`auc`, `fnr`,
+`ci95`, thresholds, `run_report`) are then reconcilable against it.
+
 ## Consequences
 - Drift is detected at build time, not discovered by a confused downstream consumer.
 - The in-process check catches serialization bugs; the external diff catches cache/persistence bugs.

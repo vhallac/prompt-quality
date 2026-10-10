@@ -44,7 +44,9 @@ from baselines import (
     emit_artifacts,
     fit_logistic,
     fnr,
+    gold_content_sha256,
     imperative_density,
+    input_display_path,
     jev_cache_entry_count,
     jev_cache_key,
     jev_cache_key_legacy,
@@ -1643,3 +1645,164 @@ def test_metrics_inputs_records_the_copy_it_was_given(tmp_path):
     recorded = metrics["inputs"]["jev_reference"]
     assert recorded["sha256"] == REFERENCE_SHA256
     assert recorded["path"] == str(other)
+
+
+# ---------------------------------------------------------------------------
+# inputs provenance (unit-009): a committed artifact has to re-emit somewhere else
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _strings_in(node):
+    """Every string key and value inside a nested JSON structure."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield str(key)
+            yield from _strings_in(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _strings_in(item)
+    elif isinstance(node, str):
+        yield node
+
+
+def _canonical_gold_digest(rows):
+    """The documented formula, re-derived here rather than called from the code."""
+    payload = [[r["id"], r["label"], r["prompt"]] for r in sorted(rows, key=lambda r: r["id"])]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def test_metrics_inputs_key_table_is_literal(tmp_path):
+    """The provenance block is a fixed set of fields, spelled out in the test.
+
+    A table generated from the code's own dict loses the case where a field is
+    deleted, which is exactly the drift this block exists to make visible.
+    """
+    rows = _report_rows()
+    store = _report_rounds(tmp_path, rows)
+    metrics, _ = assemble_baselines(
+        rows, 0.2, {}, query_fn=_report_query, round_store=store
+    )
+    assert sorted(metrics["inputs"]) == [
+        "base_rate_results",
+        "gold",
+        "gold_sha256",
+        "jev_reference",
+        "round_store",
+    ]
+
+
+def test_metrics_inputs_records_a_digest_of_the_rows_scored(tmp_path):
+    """``gold_sha256`` hashes the gold content this run scored (review F3's rule).
+
+    The path alone does not pin anything: C1 owns that file and can re-emit it
+    with a different label split, moving every number here. The digest is what
+    lets a reader tell which gold the published metrics were computed on.
+    """
+    rows = _report_rows()
+    store = _report_rounds(tmp_path, rows)
+    metrics, _ = assemble_baselines(
+        rows, 0.2, {}, query_fn=_report_query, round_store=store
+    )
+    assert metrics["inputs"]["gold_sha256"] == _canonical_gold_digest(rows)
+
+
+def test_gold_digest_tracks_content_not_order_or_path():
+    """Same rows in another order → same digest; any content change → another."""
+    rows = _report_rows()
+    base = gold_content_sha256(rows)
+    assert gold_content_sha256(list(reversed(rows))) == base
+    relabelled = [dict(r) for r in rows]
+    relabelled[0]["label"] = "negative"
+    assert gold_content_sha256(relabelled) != base
+    reworded = [dict(r) for r in rows]
+    reworded[3]["prompt"] = "totally different ask"
+    assert gold_content_sha256(reworded) != base
+    assert gold_content_sha256(rows[:-1]) != base
+
+
+def test_metrics_inputs_records_no_machine_absolute_path(tmp_path, monkeypatch):
+    """A home-directory location is recorded as ``~``-relative, never absolute.
+
+    ``inputs.round_store`` used to carry ``/home/<user>/…``, so the committed
+    artifact could not re-emit byte-identically on another box: the determinism
+    gate would name the path field and call a username non-determinism.
+    """
+    home = tmp_path / "fakehome"
+    home.mkdir()
+    monkeypatch.setattr(baselines.Path, "home", staticmethod(lambda: home))
+    store = _report_rounds(home, _report_rows())
+    metrics, _ = assemble_baselines(
+        _report_rows(),
+        0.2,
+        {},
+        query_fn=_report_query,
+        round_store=store,
+    )
+    assert metrics["inputs"]["round_store"] == "~/rounds"
+    assert str(home) not in serialize_metrics(metrics)
+    assert not [s for s in _strings_in(metrics["inputs"]) if s.startswith("/")], (
+        "inputs must not record an absolute path"
+    )
+
+
+def test_input_display_path_is_verbatim_when_it_is_not_the_convention(tmp_path, monkeypatch):
+    """Only a location under home is rewritten; overrides are recorded as read."""
+    home = tmp_path / "fakehome"
+    monkeypatch.setattr(baselines.Path, "home", staticmethod(lambda: home))
+    cases = [
+        (home / ".pi" / "agent" / "semblr" / "rounds", "~/.pi/agent/semblr/rounds"),
+        (home / "rounds", "~/rounds"),
+        (home, "~"),
+        (Path("/elsewhere/rounds"), "/elsewhere/rounds"),
+        (Path("dataset/rounds-labeled.jsonl"), "dataset/rounds-labeled.jsonl"),
+        (Path("~/rounds"), "~/rounds"),
+    ]
+    for raw, expected in cases:
+        assert input_display_path(raw) == expected, raw
+    # the same location as a str and as a Path must render alike
+    assert input_display_path(str(home / "rounds")) == input_display_path(home / "rounds")
+
+
+def test_metrics_inputs_records_the_paths_it_was_given(tmp_path):
+    """--gold/--base-rate-results overrides must not be recorded as the defaults."""
+    rows = _report_rows()
+    store = _report_rounds(tmp_path, rows)
+    gold = tmp_path / "other-gold.jsonl"
+    results = tmp_path / "other-base-rate-results.jsonl"
+    metrics, _ = assemble_baselines(
+        rows,
+        0.2,
+        {},
+        query_fn=_report_query,
+        round_store=store,
+        gold_path=gold,
+        base_rate_results_path=results,
+    )
+    assert metrics["inputs"]["gold"] == str(gold)
+    assert metrics["inputs"]["base_rate_results"] == str(results)
+
+
+def test_committed_metrics_inputs_reemit_off_this_machine():
+    """Live anchor: the committed artifact names its inputs portably and truly.
+
+    Two claims, both checkable from the committed files alone: the gold digest
+    it records is the digest of the gold that is committed beside it, and no
+    field carries this machine's home directory.
+    """
+    metrics_path = Path(baselines.METRICS_PATH)
+    if not metrics_path.is_absolute():
+        metrics_path = REPO_ROOT / metrics_path
+    gold_path = REPO_ROOT / baselines.GOLD_PATH
+    if not metrics_path.is_file() or not gold_path.is_file():
+        pytest.skip("committed metrics or gold artifact not present")
+    committed = json.loads(metrics_path.read_text(encoding="utf-8"))
+    rows, _tally = load_gold(str(gold_path))
+    inputs = committed["inputs"]
+    assert inputs["gold_sha256"] == gold_content_sha256(rows)
+    assert inputs["gold"] == str(baselines.GOLD_PATH)
+    assert inputs["base_rate_results"] == str(baselines.BASE_RATE_RESULTS_PATH)
+    assert inputs["round_store"].startswith("~/")
+    assert not [s for s in _strings_in(inputs) if s.startswith("/")]
+    assert str(Path.home()) not in json.dumps(inputs)

@@ -26,6 +26,17 @@ Hard-coding `../semblr/` assumes a specific directory layout. Environment variab
 
 The round store path is also configurable: `~/.pi/agent/semblr/rounds` by default.
 
+**A location written into a committed artifact is written home-relative, never
+machine-absolute.** C3's `metrics.inputs.round_store` used to carry
+`/home/<user>/.pi/agent/semblr/rounds`, so the artifact could not re-emit
+byte-identically on another box — the determinism gate would name the field and
+report a username as non-determinism. `baselines.input_display_path` renders any
+absolute path under home as `~/…`; a `--round-store` or
+`PROMPT_QUALITY_ROUND_STORE` override outside home is recorded verbatim, because
+then the artifact has to say what it actually read. C1 and C2 keep store paths in
+their *ephemeral* drift reports, which are not committed, so they need no such
+rendering.
+
 ## Consequences
 - Scripts are runnable from any directory layout without editing source.
 - A pinned copy inside this repository (corpus, jev reference scorer) is readable
