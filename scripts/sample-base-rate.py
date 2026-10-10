@@ -15,6 +15,13 @@ Pipeline (built incrementally across the plan's work units):
 
 Definitions (issue #2):
   frame     = 5430 scan ids − 244 gold ids − missing-round-file ids = 5159
+
+The frame's missing-round-file term is a *recorded* fact: the manifest's
+``missing_ids`` ledger. The live round store keeps growing, so deriving the
+frame from it would silently redraw the sample on a different population; the
+store is now consulted only to report drift (``check_store_drift``), never to
+re-derive ``sampled_ids``. Seed + pinned snapshot reproduce the identical
+sample on any machine, with or without a round store present.
   positive  : fault-type bins (prompt-misread, stale-context, other, retrieval-noise)
   negative  : no-fault-within-round + external
   excluded  : ambiguous
@@ -96,8 +103,23 @@ DROP_IDS = frozenset(
 )
 
 # Eligible frame = 5430 − 244 gold − 29 missing-round-file = 5159 (issue #2).
+#
+# These anchor the *pinned snapshot*, not the live round store. The store today
+# reports 14 absent ids and a 5174-entry frame, because 15 of the 29 recorded
+# rounds were recovered upstream after C2 was drawn; the recorded frame stays the
+# sample's frame. ``EXPECTED_MISSING`` exists so a hand-edited ``missing_ids``
+# ledger fails naming the field it broke instead of changing the frame quietly.
 EXPECTED_GOLD = 244
+EXPECTED_MISSING = 29
 EXPECTED_FRAME = 5159
+
+# The manifest field each hand-maintained anchor governs, in check order.
+FRAME_ANCHORS = (
+    ("corpus_size", EXPECTED_CORPUS),
+    ("gold_size", EXPECTED_GOLD),
+    ("missing_size", EXPECTED_MISSING),
+    ("frame_size", EXPECTED_FRAME),
+)
 
 # Default sample size (issue #2: "sample ~100 random unscanned rounds").
 DEFAULT_SAMPLE_SIZE = 100
@@ -226,6 +248,7 @@ def build_manifest(
     gold_path: str | Path = DEFAULT_GOLD,
     round_store: str | Path = DEFAULT_ROUND_STORE,
     drop_ids: Iterable[str] = DROP_IDS,
+    missing_ids: Iterable[str] | None = None,
 ) -> dict:
     """Assemble the sample manifest: seed, frame arithmetic, sampled ids.
 
@@ -236,10 +259,19 @@ def build_manifest(
     ``drop_ids`` are C1's two Q2-dropped gold ids; they are threaded so a
     synthetic fixture can supply its own set and stay fully isolated from the
     live gold split.
+
+    ``missing_ids`` is the recorded ledger: when supplied it *replaces* the
+    round-store scan, so the frame is re-derived from what was absent at build
+    time rather than from what the live store happens to hold now. Leaving it
+    ``None`` is the fresh-draw path, used only when there is no snapshot to pin.
     """
     corpus = corpus_ids(corpus_path)
     gold = gold_ids(gold_path, drop_ids)
-    missing = missing_round_ids(corpus, round_store)
+    missing = (
+        missing_round_ids(corpus, round_store)
+        if missing_ids is None
+        else sorted(set(missing_ids))
+    )
     frame = eligible_frame(corpus, gold, missing)
     sampled = draw_sample(frame, sample_size, seed)
     return {
@@ -254,35 +286,189 @@ def build_manifest(
     }
 
 
+def manifest_bytes(manifest: dict) -> bytes:
+    """The pinned serialization of a manifest: sorted keys, trailing newline."""
+    return (
+        json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+
+
 def write_manifest(manifest: dict, path: str | Path = DEFAULT_MANIFEST) -> Path:
     """Write the manifest deterministically (sorted keys, trailing newline)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(manifest, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    path.write_bytes(manifest_bytes(manifest))
     return path
 
 
-def assert_anchors(manifest: dict) -> None:
-    """Fail loudly if the frame arithmetic drifts from the issue anchors.
+# --- Pinned frame snapshot ----------------------------------------------------
 
-    A drift means the corpus, the gold split, or the round store changed under
-    us; the base-rate estimate would then no longer be comparable to C1.
+# The fields a snapshot must re-derive from its own recorded store facts. Named
+# in one place so a reproduction failure can say which of them moved.
+SNAPSHOT_FIELDS = (
+    "seed",
+    "sample_size",
+    "corpus_size",
+    "gold_size",
+    "missing_size",
+    "frame_size",
+    "missing_ids",
+    "sampled_ids",
+)
+
+
+class SnapshotError(RuntimeError):
+    """A pinned snapshot no longer reproduces from its own recorded facts."""
+
+
+class StoreDriftError(SnapshotError):
+    """The live round store contradicts the snapshot where the sample cares."""
+
+
+def _brief(value: object) -> str:
+    """A short, stable rendering of a snapshot field for an error message."""
+    if isinstance(value, list):
+        if not value:
+            return "len=0"
+        return f"len={len(value)} first={value[0]!r}"
+    return repr(value)
+
+
+def load_manifest(path: str | Path = DEFAULT_MANIFEST) -> dict | None:
+    """Read the snapshot at ``path``, or ``None`` when nothing is pinned there."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def reproduce_snapshot(
+    snapshot: dict,
+    corpus_path: str | Path = DEFAULT_CORPUS,
+    gold_path: str | Path = DEFAULT_GOLD,
+    drop_ids: Iterable[str] = DROP_IDS,
+) -> dict:
+    """Re-derive a manifest from the snapshot's own recorded ledger.
+
+    The frame's three terms are all pinned inputs: the corpus id list and the
+    gold split from the committed artifacts, the absent-round-file ids from
+    ``snapshot["missing_ids"]``. No round store is read, so the same seed over
+    the same snapshot yields the identical sample on any machine — which is the
+    determinism obligation, now independent of a live store that keeps moving.
+
+    Every ``SNAPSHOT_FIELDS`` entry is compared, and the error names each field
+    that does not reproduce instead of failing on a bare equality.
     """
-    if manifest["corpus_size"] != EXPECTED_CORPUS:
-        raise SystemExit(
-            f"corpus drift: expected {EXPECTED_CORPUS}, got {manifest['corpus_size']}"
+    absent = [field for field in SNAPSHOT_FIELDS if field not in snapshot]
+    if absent:
+        raise SnapshotError(
+            "pinned snapshot is not a complete frame record — missing fields: "
+            + ", ".join(absent)
         )
-    if manifest["gold_size"] != EXPECTED_GOLD:
-        raise SystemExit(
-            f"gold drift: expected {EXPECTED_GOLD}, got {manifest['gold_size']}"
+    rebuilt = build_manifest(
+        seed=snapshot["seed"],
+        sample_size=snapshot["sample_size"],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        drop_ids=drop_ids,
+        missing_ids=snapshot["missing_ids"],
+    )
+    diverged = [
+        f"{field}: recorded {_brief(snapshot.get(field))} vs "
+        f"re-derived {_brief(rebuilt.get(field))}"
+        for field in SNAPSHOT_FIELDS
+        if rebuilt.get(field) != snapshot.get(field)
+    ]
+    if diverged:
+        raise SnapshotError(
+            "pinned snapshot does not reproduce — " + "; ".join(diverged)
         )
-    if manifest["frame_size"] != EXPECTED_FRAME:
-        raise SystemExit(
-            f"frame drift: expected {EXPECTED_FRAME}, got {manifest['frame_size']}"
+    return rebuilt
+
+
+def check_store_drift(
+    snapshot: dict,
+    round_store: str | Path = DEFAULT_ROUND_STORE,
+    corpus_path: str | Path = DEFAULT_CORPUS,
+    gold_path: str | Path = DEFAULT_GOLD,
+    drop_ids: Iterable[str] = DROP_IDS,
+) -> dict:
+    """Report how the live round store differs from the pinned ledger.
+
+    Reading only: the frame the sample was drawn from stays the recorded one, so
+    a moved store is disclosed by name rather than silently redrawn. ``drifted_fields``
+    lists the snapshot fields the live store would have produced differently.
+
+    Raises ``StoreDriftError`` when the difference reaches the recorded sample —
+    a sampled id whose round file is gone can no longer be re-adjudicated, so the
+    snapshot is no longer honest about what it can reproduce.
+    """
+    corpus = corpus_ids(corpus_path)
+    gold = gold_ids(gold_path, drop_ids)
+    recorded = set(snapshot["missing_ids"])
+    live_missing = set(missing_round_ids(corpus, round_store))
+    recovered = sorted(recorded - live_missing)
+    newly_missing = sorted(live_missing - recorded)
+    sampled_missing = missing_round_ids(snapshot["sampled_ids"], round_store)
+    live_frame = len(eligible_frame(corpus, gold, sorted(live_missing)))
+
+    drifted: list[str] = []
+    if snapshot["missing_size"] != len(live_missing):
+        drifted.append("missing_size")
+    if recovered or newly_missing:
+        drifted.append("missing_ids")
+    if snapshot["frame_size"] != live_frame:
+        drifted.append("frame_size")
+
+    report = {
+        "round_store": str(round_store),
+        "drifted_fields": drifted,
+        "recorded_missing_size": snapshot["missing_size"],
+        "live_missing_size": len(live_missing),
+        "recovered_ids": recovered,
+        "newly_missing_ids": newly_missing,
+        "sampled_missing_ids": sampled_missing,
+        "pinned_frame_size": snapshot["frame_size"],
+        "live_frame_size": live_frame,
+    }
+    if sampled_missing:
+        raise StoreDriftError(
+            "live round store invalidates the pinned sample: sampled_missing_ids "
+            f"({len(sampled_missing)}) first={sampled_missing[0]!r} "
+            f"store={round_store}"
         )
+    return report
+
+
+def drift_summary(report: dict) -> str:
+    """One line naming what moved, and stating that nothing was redrawn."""
+    if not report["drifted_fields"]:
+        return "store drift: none — the live round store matches the pinned ledger"
+    return (
+        "store drift (the pinned snapshot stays authoritative; the frame was not "
+        "redrawn): fields="
+        + ",".join(report["drifted_fields"])
+        + f" recorded_missing={report['recorded_missing_size']}"
+        + f" live_missing={report['live_missing_size']}"
+        + f" recovered={len(report['recovered_ids'])}"
+        + f" newly_missing={len(report['newly_missing_ids'])}"
+        + f" frame={report['pinned_frame_size']}->{report['live_frame_size']}"
+    )
+
+
+def assert_anchors(manifest: dict) -> None:
+    """Fail loudly if the frame arithmetic drifts from the pinned anchors.
+
+    The anchors describe the pinned snapshot. On the live-scan path a mismatch
+    means the corpus, the gold split or the round store moved under the frame —
+    the base-rate estimate would no longer be comparable to C1, so a new draw
+    needs a new stage with its own recorded numbers, not a silent redraw. On the
+    snapshot path a mismatch means the recorded ledger was edited.
+    """
+    for field, expected in FRAME_ANCHORS:
+        got = manifest[field]
+        if got != expected:
+            raise SystemExit(f"{field} drift: expected {expected}, got {got}")
 
 
 # --- S2 adjudication reuse ---------------------------------------------------
@@ -734,24 +920,77 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="only rebuild/write the sample manifest (no adjudication)",
     )
+    ap.add_argument(
+        "--redraw",
+        action="store_true",
+        help="derive the frame from a live round-store scan; refuses to overwrite a "
+        "pinned snapshot, so a new draw needs a new --manifest path",
+    )
     args = ap.parse_args(argv)
 
-    manifest = build_manifest(
-        seed=args.seed,
-        sample_size=args.sample_size,
-        corpus_path=args.corpus,
-        gold_path=args.gold,
-        round_store=args.rounds_dir,
-    )
+    snapshot = load_manifest(args.manifest)
+    if snapshot is None:
+        # Fresh-draw path: nothing is pinned at this manifest, so the frame is
+        # scanned from the live store and assert_anchors is what makes a moved
+        # store fail loudly instead of silently drawing a different sample.
+        manifest = build_manifest(
+            seed=args.seed,
+            sample_size=args.sample_size,
+            corpus_path=args.corpus,
+            gold_path=args.gold,
+            round_store=args.rounds_dir,
+        )
+        frame_source = "live store scan (nothing pinned at the manifest path)"
+    else:
+        if args.redraw:
+            raise SystemExit(
+                f"--redraw refuses to overwrite the pinned snapshot at {args.manifest}: "
+                "the recorded frame is the sample that was adjudicated. A bigger frame "
+                "is a new stage — new seed, new --manifest path."
+            )
+        if args.seed != snapshot["seed"] or args.sample_size != snapshot["sample_size"]:
+            raise SystemExit(
+                "seed/sample_size conflict with the pinned snapshot: it was drawn with "
+                f"seed={snapshot['seed']} sample_size={snapshot['sample_size']}, "
+                f"this run asked for seed={args.seed} sample_size={args.sample_size}. "
+                "A new draw is a new stage: pass --redraw with a new --manifest path."
+            )
+        manifest = reproduce_snapshot(
+            snapshot,
+            corpus_path=args.corpus,
+            gold_path=args.gold,
+        )
+        frame_source = "pinned snapshot (the live round store did not draw the sample)"
+
     assert_anchors(manifest)
-    manifest_out = write_manifest(manifest, args.manifest)
+
+    if snapshot is None:
+        manifest_out = write_manifest(manifest, args.manifest)
+    else:
+        drift = check_store_drift(
+            manifest,
+            round_store=args.rounds_dir,
+            corpus_path=args.corpus,
+            gold_path=args.gold,
+        )
+        print(drift_summary(drift))
+        existing = Path(args.manifest).read_bytes()
+        if existing != manifest_bytes(manifest):
+            raise SystemExit(
+                f"reproducing the pinned snapshot would change {args.manifest}; "
+                "the recorded sample no longer matches its own bytes, so nothing was "
+                "written"
+            )
+        manifest_out = Path(args.manifest)
+
     print(
         f"frame={manifest['frame_size']} "
         f"(corpus={manifest['corpus_size']} − gold={manifest['gold_size']} "
         f"− missing={manifest['missing_size']}) "
-        f"seed={manifest['seed']} sampled={len(manifest['sampled_ids'])}"
+        f"seed={manifest['seed']} sampled={len(manifest['sampled_ids'])} "
+        f"source={frame_source}"
     )
-    print(f"wrote {manifest_out}")
+    print(f"manifest: {manifest_out}")
     if args.manifest_only:
         return 0
 

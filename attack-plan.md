@@ -4,6 +4,20 @@
 
 Pipeline = `jev-round-scan.py` → `fault-pipeline.py`, with `jev-chain-fault.py` as a side tool.
 
+The scan-stage scorer is pinned in this repository at
+`scripts/reference/jev-round-scan.py` — a byte-for-byte copy of semblr's
+`scripts/jev-round-scan.py` at commit `ba10970`, sha256
+`4e294839a341c953d38dba17dadfd87be53d36f536700d3274da16f387bf8704`. Line
+citations below are to that pinned copy (`build_state` 78–92,
+`build_refine_state` 154–173, `QUESTIONS` 46–76, `MODEL` 44, `--state-chars`
+default 272), so they resolve from a clean clone. `baseline-metrics.json`'s
+`inputs.jev_reference` records the same digest, and `scripts/baselines.test.py`
+asserts C3's copies against this file. The rest of `inputs` names its locations
+the same way: `gold_sha256` is the digest of the gold rows scored, and the round
+store is recorded home-relative (`~/.pi/agent/semblr/rounds`) — never a
+machine-absolute path, which would make a committed artifact re-emit differently
+somewhere else.
+
 1. **Scan (weak supervision).** `jev-round-scan.py` scores all 5430 scanned rounds on
    (a) user frustration 0–4 and (b) correction-of-round-discovery-failure probability.
    Thresholds trip → examination bin. Refine pass rebuilds state from the prompt +
@@ -33,10 +47,14 @@ Pipeline = `jev-round-scan.py` → `fault-pipeline.py`, with `jev-chain-fault.py
 1. **Failure definition changes.** Not regex-supersession. Ground truth = S2 verdict
    (fault bins are positives; no-fault and external are negatives; ambiguous excluded).
    Weak labels = jev-scan frustration/correction scores.
-2. **Known leak.** jev-scan and refine passed saw parent-response context. A
-   prompt-only model trained on them inherits session-aware signal. Measure the leak:
-   train two models — prompt-only features vs prompt+parent-response features — and
-   report the AUC delta. The delta IS the "context value" number.
+2. **Known leak.** `jev-round-scan.py` passes the round's **own** response to the
+   scorer (`build_state`, `scripts/reference/jev-round-scan.py:78-92`); only
+   `--refine` (`build_refine_state`, `:154-173`) uses the **parent**
+   response. A prompt-only re-score strips that context. Measure both deltas:
+   **leak delta** = `AUC(prompt+own-response) − AUC(prompt-only)` — how much the scorer
+   leans on the response it is judging, the headline "context value"; and **session
+   delta** = `AUC(prompt+parent-response) − AUC(prompt-only)` — the value of
+   prior-round context. Both are reported; neither is dropped (issue #3).
 3. **Label the origin, not the trigger.** Use S2 root-cause evidence ("fault belongs
    to the parent round") to back-propagate positive labels to origin rounds. This
    aligns the dataset with the real question: *which prompt initiated the doomed
@@ -57,9 +75,13 @@ Pipeline = `jev-round-scan.py` → `fault-pipeline.py`, with `jev-chain-fault.py
   prompt text, S2 bin, fault type, root-cause evidence; back-propagate origins;
   sample ~100 random rounds for base-rate S2 adjudication. Output:
   `dataset/rounds-labeled.jsonl` (gold, ~350), `dataset/prompt-corpus.jsonl` (5430 weak).
+  The store-time facts of the build are pinned in `dataset/c1-build-snapshot.json`, so the
+  corpus's unresolved ledger is a recorded input and a re-run on a moved round store reproduces
+  both artifacts byte-for-byte (see `design/decisions/002`).
 - **E2 — baselines.** (a) base rate; (b) lexical heuristics (length, imperative
-  density, deixis, output-contract absence); (c) jev prompt-only re-score (strip
-  context from the jev payload, re-run decisions API).
+  density, deixis, output-contract absence); (c) jev re-score in three variants —
+  prompt-only (context stripped), prompt+own-response, and prompt+parent-response —
+  yielding the leak and session deltas of refinement 2.
 - **E3 — trained scorer.** Small classifier on weak labels (with the leak measured
   per refinement 2), validated on the adjudicated gold only.
 - **E4 — calibration & ablation.** ECE binned; stratify fresh vs continuation;

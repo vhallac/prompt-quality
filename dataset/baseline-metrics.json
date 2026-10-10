@@ -1,0 +1,694 @@
+{
+  "baselines": {
+    "base_rate": {
+      "auc": {
+        "ci95": [
+          0.5,
+          0.5
+        ],
+        "degenerate_resamples": 0,
+        "n_boot": 2000,
+        "point": 0.5,
+        "seed": 20260109
+      },
+      "fnr": {
+        "corpus_base_rate": {
+          "achieved_alarm_rate": 0.0,
+          "alarm_rate_tolerance": 0.002136752136752137,
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "note": "non-rate-matched operating point (ii): achieved alarm rate 0 vs target 0.193878 misses by more than the stated 0.00213675 tolerance; the score vector has only 1 distinct value(s) so the target rate is unreachable and the nearest candidate was selected — the threshold alarms nothing, so FNR is 1.0 by construction",
+          "point": 1.0,
+          "target_alarm_rate": 0.19387755102040816,
+          "threshold": 0.12393162393162395
+        },
+        "youden_j": {
+          "achieved_alarm_rate": 1.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "point": 0.0,
+          "target_alarm_rate": null,
+          "threshold": 0.12393162393162394
+        }
+      },
+      "n": 234,
+      "negatives": 205,
+      "positives": 29
+    },
+    "jev_own_response": {
+      "auc": {
+        "ci95": [
+          0.2692307692307692,
+          0.5045076282940361
+        ],
+        "degenerate_resamples": 0,
+        "n_boot": 2000,
+        "point": 0.3847771236333053,
+        "seed": 20260109
+      },
+      "fnr": {
+        "corpus_base_rate": {
+          "achieved_alarm_rate": 0.19230769230769232,
+          "alarm_rate_tolerance": 0.002136752136752137,
+          "ci95": [
+            0.6896551724137931,
+            0.9565217391304348
+          ],
+          "point": 0.8275862068965517,
+          "target_alarm_rate": 0.19387755102040816,
+          "threshold": 0.7925
+        },
+        "youden_j": {
+          "achieved_alarm_rate": 0.06837606837606838,
+          "ci95": [
+            0.0,
+            0.9259259259259259
+          ],
+          "point": 0.896551724137931,
+          "target_alarm_rate": null,
+          "threshold": 0.9125000000000001
+        }
+      },
+      "n": 234,
+      "negatives": 205,
+      "positives": 29
+    },
+    "jev_parent_response": {
+      "auc": {
+        "ci95": [
+          0.10018214936247723,
+          0.5807086614173228
+        ],
+        "degenerate_resamples": 1,
+        "n_boot": 2000,
+        "point": 0.32113821138211385,
+        "seed": 20260109
+      },
+      "fnr": {
+        "corpus_base_rate": {
+          "achieved_alarm_rate": 0.1984732824427481,
+          "alarm_rate_tolerance": 0.003816793893129771,
+          "ci95": [
+            0.5,
+            1.0
+          ],
+          "note": "non-rate-matched operating point (ii): achieved alarm rate 0.198473 vs target 0.193878 misses by more than the stated 0.00381679 tolerance; the score vector has only 77 distinct value(s) so the target rate is unreachable and the nearest candidate was selected — the threshold alarms 0.198473 of rows",
+          "point": 0.75,
+          "target_alarm_rate": 0.19387755102040816,
+          "threshold": 0.83875
+        },
+        "youden_j": {
+          "achieved_alarm_rate": 0.1984732824427481,
+          "ci95": [
+            0.0,
+            0.8333333333333334
+          ],
+          "point": 0.75,
+          "target_alarm_rate": null,
+          "threshold": 0.83875
+        }
+      },
+      "n": 131,
+      "negatives": 123,
+      "positives": 8
+    },
+    "jev_prompt_only": {
+      "auc": {
+        "ci95": [
+          0.3571603427172583,
+          0.6061907317945965
+        ],
+        "degenerate_resamples": 0,
+        "n_boot": 2000,
+        "point": 0.4809924306139613,
+        "seed": 20260109
+      },
+      "fnr": {
+        "corpus_base_rate": {
+          "achieved_alarm_rate": 0.19230769230769232,
+          "alarm_rate_tolerance": 0.002136752136752137,
+          "ci95": [
+            0.6296296296296297,
+            0.92
+          ],
+          "point": 0.7931034482758621,
+          "target_alarm_rate": 0.19387755102040816,
+          "threshold": 0.8875
+        },
+        "youden_j": {
+          "achieved_alarm_rate": 0.10256410256410256,
+          "ci95": [
+            0.0,
+            0.8846153846153846
+          ],
+          "point": 0.8275862068965517,
+          "target_alarm_rate": null,
+          "threshold": 0.92625
+        }
+      },
+      "n": 234,
+      "negatives": 205,
+      "positives": 29
+    },
+    "lexical": {
+      "auc": {
+        "ci95": [
+          0.5303497942386831,
+          0.7448529411764706
+        ],
+        "degenerate_resamples": 0,
+        "n_boot": 2000,
+        "point": 0.636417157275021,
+        "seed": 20260109
+      },
+      "fnr": {
+        "corpus_base_rate": {
+          "achieved_alarm_rate": 0.19230769230769232,
+          "alarm_rate_tolerance": 0.002136752136752137,
+          "ci95": [
+            0.4838709677419355,
+            0.8214285714285714
+          ],
+          "point": 0.6551724137931034,
+          "target_alarm_rate": 0.19387755102040816,
+          "threshold": -1.8256952084884548
+        },
+        "youden_j": {
+          "achieved_alarm_rate": 0.32905982905982906,
+          "ci95": [
+            0.03571428571428571,
+            0.631578947368421
+          ],
+          "point": 0.4482758620689655,
+          "target_alarm_rate": null,
+          "threshold": -1.9055896090102606
+        }
+      },
+      "n": 234,
+      "negatives": 205,
+      "positives": 29
+    }
+  },
+  "corpus_base_rate_target": 0.19387755102040816,
+  "deltas": {
+    "leak": {
+      "arms": {
+        "comparison": "jev_own_response",
+        "reference": "jev_prompt_only"
+      },
+      "auc_marginal": {
+        "comparison": 0.3847771236333053,
+        "difference": -0.096215306980656,
+        "reference": 0.4809924306139613
+      },
+      "auc_reference_paired": {
+        "comparison": 0.3847771236333053,
+        "difference": -0.096215306980656,
+        "reference": 0.4809924306139613
+      },
+      "ci95": [
+        -0.1807511737089202,
+        -0.013147194361615655
+      ],
+      "n_boot": 2000,
+      "n_pairs": 234,
+      "n_reference_rows": 234,
+      "point": -0.096215306980656,
+      "population": "n_pairs = 234: 234 of the 234 reference-arm rows score non-null in both arms. Rows unpairable on either side (extensions 4a/4b) are excluded from this delta only, so the point is a paired difference on that subpopulation and need not equal the difference of the two marginal AUCs published under `baselines`; auc_reference_paired holds both arms' AUCs computed on these paired rows, and its difference is the point.",
+      "seed": 20260109
+    },
+    "session": {
+      "arms": {
+        "comparison": "jev_parent_response",
+        "reference": "jev_prompt_only"
+      },
+      "auc_marginal": {
+        "comparison": 0.32113821138211385,
+        "difference": -0.15985421923184745,
+        "reference": 0.4809924306139613
+      },
+      "auc_reference_paired": {
+        "comparison": 0.32113821138211385,
+        "difference": -0.023882113821138196,
+        "reference": 0.34502032520325204
+      },
+      "ci95": [
+        -0.194,
+        0.10476190476190483
+      ],
+      "n_boot": 2000,
+      "n_pairs": 131,
+      "n_reference_rows": 234,
+      "point": -0.023882113821138196,
+      "population": "n_pairs = 131: 131 of the 234 reference-arm rows score non-null in both arms. Rows unpairable on either side (extensions 4a/4b) are excluded from this delta only, so the point is a paired difference on that subpopulation and need not equal the difference of the two marginal AUCs published under `baselines`; auc_reference_paired holds both arms' AUCs computed on these paired rows, and its difference is the point.",
+      "seed": 20260109
+    }
+  },
+  "feature_aucs": {
+    "deixis": {
+      "ci95": [
+        0.2885210396039604,
+        0.48752572016460904
+      ],
+      "degenerate_resamples": 0,
+      "n_boot": 2000,
+      "point": 0.387973086627418,
+      "seed": 20260109
+    },
+    "imperative_density": {
+      "ci95": [
+        0.4858542899408284,
+        0.6724938118811881
+      ],
+      "degenerate_resamples": 0,
+      "n_boot": 2000,
+      "point": 0.5750210260723297,
+      "seed": 20260109
+    },
+    "length": {
+      "ci95": [
+        0.34011774600504624,
+        0.5967134026835519
+      ],
+      "degenerate_resamples": 0,
+      "n_boot": 2000,
+      "point": 0.4663582842724979,
+      "seed": 20260109
+    },
+    "output_contract_absence": {
+      "ci95": [
+        0.4182692307692308,
+        0.6087962962962963
+      ],
+      "degenerate_resamples": 0,
+      "n_boot": 2000,
+      "point": 0.5131202691337258,
+      "seed": 20260109
+    }
+  },
+  "feature_definitions": {
+    "deixis": {
+      "description": "deictic/back-reference marker count per 100 tokens",
+      "empty_prompt_score": 0.0,
+      "markers": [
+        "the previous",
+        "as discussed",
+        "it",
+        "that",
+        "this",
+        "yes",
+        "again",
+        "he",
+        "she",
+        "they",
+        "them"
+      ]
+    },
+    "ext_3a_scope": "'An ambiguous feature that matches nothing scores 0' applies to the count/ratio features only: length, imperative_density, deixis. output_contract_absence is an absence indicator, so a prompt that matches none of its markers scores 1.",
+    "imperative_density": {
+      "description": "fraction of clauses whose first token is an imperative verb",
+      "empty_prompt_score": 0.0,
+      "imperative_verbs": [
+        "add",
+        "build",
+        "change",
+        "check",
+        "commit",
+        "configure",
+        "copy",
+        "create",
+        "delete",
+        "deploy",
+        "disable",
+        "do",
+        "enable",
+        "fix",
+        "implement",
+        "install",
+        "make",
+        "merge",
+        "move",
+        "pull",
+        "push",
+        "refactor",
+        "remove",
+        "rename",
+        "replace",
+        "revert",
+        "run",
+        "set",
+        "test",
+        "try",
+        "update",
+        "use",
+        "verify",
+        "write"
+      ]
+    },
+    "length": {
+      "description": "whitespace-token count of the prompt (chars also recorded)",
+      "empty_prompt_score": 0.0,
+      "units": "tokens"
+    },
+    "output_contract_absence": {
+      "contract_phrases": [
+        "must",
+        "should",
+        "acceptance",
+        "criteria",
+        "requirement",
+        "deliverable"
+      ],
+      "description": "1 when the prompt states no explicit deliverable (no file path, no format word, no acceptance/'must' phrasing), else 0",
+      "format_words": [
+        "bullet",
+        "csv",
+        "diff",
+        "format",
+        "json",
+        "list",
+        "markdown",
+        "md",
+        "patch",
+        "schema",
+        "snippet",
+        "table",
+        "template",
+        "tsv",
+        "xml",
+        "yaml",
+        "yml"
+      ],
+      "no_marker_score": 1.0
+    }
+  },
+  "gold": {
+    "negatives": 205,
+    "positives": 29,
+    "scored_rows": 234
+  },
+  "inputs": {
+    "base_rate_results": "dataset/base-rate-results.jsonl",
+    "gold": "dataset/rounds-labeled.jsonl",
+    "gold_sha256": "b9e477a9c744dd7186d4c672bed1cfd4820efb648d6a8f3f70eff645b28e6628",
+    "jev_reference": {
+      "path": "scripts/reference/jev-round-scan.py",
+      "questions_sha256_field": "jev.questions_sha256",
+      "sha256": "4e294839a341c953d38dba17dadfd87be53d36f536700d3274da16f387bf8704",
+      "upstream": "semblr scripts/jev-round-scan.py at ba10970"
+    },
+    "round_store": "~/.pi/agent/semblr/rounds"
+  },
+  "jev": {
+    "model": "typesafe/jev-1.13",
+    "questions_sha256": "0af0518d16be199ccb22ab4d60d159269dd5a555dc55c0cb15f2510cab2c6c69",
+    "response_marker": "[not shown]",
+    "score_definition": "max(correction.noul, frustration.score / 4)",
+    "state_chars": 12000
+  },
+  "lexical_weights": {
+    "features": {
+      "deixis": {
+        "mean": 4.629417835248133,
+        "std": 4.273715740395242,
+        "weight": -0.22725718395858113
+      },
+      "imperative_density": {
+        "mean": 0.06581001861798963,
+        "std": 0.16827354021478486,
+        "weight": 0.24949768236201625
+      },
+      "length": {
+        "mean": 33.77350427350427,
+        "std": 38.37617426174645,
+        "weight": 0.05381585339460327
+      },
+      "output_contract_absence": {
+        "mean": 0.6666666666666666,
+        "std": 0.4714045207910317,
+        "weight": 0.07145867528020407
+      }
+    },
+    "intercept": -2.006206269474709
+  },
+  "n_boot": 2000,
+  "run_report": {
+    "delta_exclusions": {
+      "leak": [],
+      "session": [
+        "06ab03b96a046f60527eab4781a1f00c",
+        "075403a44e3517ca53c5f75e6fc16db5",
+        "078d01e21125fd1a372a9fce2f2eda47",
+        "0828e0fb711bb8575df5495098b229a9",
+        "0a32321d18b8df0970527f754d9afd67",
+        "0b63b616bcf9c43cd637c6af9e7a9fd4",
+        "0e074c9b3ecc935497b383a24194dc84",
+        "0ed2d08547b372f60095a6b99431129d",
+        "1132141024deca5d1424245992faa8e1",
+        "11384a2aab580a6c13fb5ae3105fafec",
+        "1217d470e49e38ed66f2225f79ac0eee",
+        "17445d7040bb9e0c9128dfbe7f52f84e",
+        "17e689d89bca5b31aef7e8175d6ad0be",
+        "180980867b06b8d45ff000e670caa700",
+        "1df501be82da6044128b2ca115c1f314",
+        "1f276bae56b4efe7ce40c027b00af268",
+        "20131acb86510916c5a9b665623fbc4d",
+        "21c8c2fa6fcc24ffe05725e1379fa52c",
+        "239d24f4b3e6cc001eb6ce3aff1d8e81",
+        "2f0d89a1c1c8be98e6110519681074b0",
+        "32d0caa60fb42b90dde48274d4195853",
+        "34423abf68d67896a4d122ce349d21ae",
+        "345d5134a522d3d0e5a78fc7530f2891",
+        "360508fd65c2aea059b9fe9ff9c17cd4",
+        "37caaa88b732adba15cc69fcc006dae0",
+        "3d25be494efa2a0661d1c875563e3990",
+        "4024b13f3f7db1d178ec1f2148778ecb",
+        "40d1cd66075294a30a8fa84581285c35",
+        "413295173cbab662f915398448fcf9b8",
+        "41dc7daaab775c3cba9aaef39e8bca0e",
+        "48a6574566d708750d87511888191609",
+        "496755c881c3bc99fd617f7b0601d0c2",
+        "4a31751bd005c276f1717c5060f64e8e",
+        "4a795cfed1de75573ff50abcdd6cf44e",
+        "512787622e4fc7d3b61eb857d0f6f1d1",
+        "51f6a57f32c0b03bd8c17ca3d8171cb4",
+        "5411de68a6169e4e0453bb493cff4150",
+        "5819753b3871cc2fe2aa2e60518eb246",
+        "5c76813ba7849b9185e3b72d4d99c417",
+        "619dbbe6b0a4b3e7ccbdf9e3010f2db9",
+        "6270f52d9034b0d8c54112e9e30a6f69",
+        "6489202d656b188b044812ddc2bda256",
+        "6669fd465b32b78c28eb6fb0a8fdf473",
+        "682ccac16063112c4d5f1c34a641b517",
+        "6956397a26939546ecb75983ecd4d3fe",
+        "6cd8b86d744ccc13e31d2f72fa4991dd",
+        "740b2aad6a91530427ac860453b4e461",
+        "74d0024cee88717c2675c062bf346561",
+        "7742ced264ef27039887bfd23eff3289",
+        "79a2b39101085fa8a13303d17e36254e",
+        "7bc96d76a8fdbf340e0beef805a123a4",
+        "7da5d32a0d88f46e8c24933dafbcb956",
+        "84501f714f415fdc536ac8e71a216d76",
+        "855146fb1c0d86c40da35439446612d3",
+        "87a50c27bb9aec3fb55ae835be63b098",
+        "8d27d235b446724b6ee6299200456a5e",
+        "8d745b343790d94a1dbc794b699cdbaf",
+        "91c74bb7af48a31ba0d9c53d0a3d17d9",
+        "971675ebf811bf416d19e322bc704030",
+        "99ad9b8a7ee2cc48ff6b6432550e540d",
+        "9cadbabd415e47be9c8c07de68680a78",
+        "9e1542b902168a3715eac3929bfe6a94",
+        "9eed089ed974bcc2c98ef620e0c8b945",
+        "a2bfe982e08f918d82410918cdb6e287",
+        "a2c769835518ba74d75b2c23d840f1e4",
+        "a5190c1bac23f388bf88b9c5fd2f13b0",
+        "a535b97d9d58a4737b8b0e1ef6067893",
+        "a7bdbc121679686cac6be4bbf4c16ae0",
+        "a8f1ffe36ffa681c3e2a85bf7e34189d",
+        "b0ed51df2c477903f2e5fefa121a232f",
+        "b1a665d812003170d4006fc4eab0c458",
+        "b3a7b4c5af333a565180d569367b1994",
+        "b3d1478de6fc4ad38b8bcce8133e628a",
+        "b60d2684a47436e591950b76b54c0012",
+        "b646e15e9ce38f3d3da10b0c4a5986a2",
+        "bb666159fb11ac65b80190203608f13d",
+        "bcb502d673ac1e1b7bcfdec6bc6ea188",
+        "bd16ea0c74fa1af12d6a0555af05b5ab",
+        "c3d5faa20bd979a7683194e0150be982",
+        "c45949282bacc489b8e6f9d0b1c31556",
+        "c61880c45024ba29368abf2af59df8a1",
+        "c78655d8f5e42594988cd8d1179e57dc",
+        "d31802bd6efdbe55a1179cf425b06d37",
+        "d7b7ba28190644bf370148950fa3ccf2",
+        "d7c118c6811737e03b1ed6f54b6040d0",
+        "d81ec7d2cac8ce461c843238479ec02c",
+        "dc59e7274db1fc7665416ded40d8eb86",
+        "dd613fe9793bc419a4196f64ae7ec882",
+        "df51277c7de5e061f245a7564bcc0bd3",
+        "dfacd94decf071428124e494c069623a",
+        "ea50fa8bd16a3ca38ff981dffc647c84",
+        "ee2f5567df2623022c3260e7a6fcb46e",
+        "f07431d19c428ed9d8647a7fa1ed70bd",
+        "f08780055b7f62a329d11ec4ba45def8",
+        "f1d42af6b03b324be8e4b3b10f8b2944",
+        "f2ec4fc5a969bf05f0de9252b4f9d883",
+        "f5d076084fed8e4d1050c76d3d398fcb",
+        "fa1347e11e22ebc1299d054ecb32bd65",
+        "fb28aaa28b3dabe7ab91c2ba1b449042",
+        "fd818773eec7959658da97680e74e94c",
+        "fdff138a0e6e55ca1baedb9e3460701a",
+        "fe7961a544389bcced7ce57f274e0c1a",
+        "ffb14ddef62f2fbd84ecc71309e38c27"
+      ]
+    },
+    "excluded_ids": [
+      "4a3cd39e62c987ffbe657866d73233cb",
+      "64b3e2d47d001e5d2e4a43c860ab6af0",
+      "7e8ae16249d89e98a569271ff4a71b5d",
+      "81f4ebc87d5713cf13ef191bf311b8a1",
+      "8a882115acd374e9f2f1522fa6f62774",
+      "9566700fa5803e884de7ae601903a666",
+      "9b453efa175f1622779650aab7c073a7",
+      "ccb434032a0d3a497f5efdefe09c4636"
+    ],
+    "null_scores": {
+      "own_response": {},
+      "parent_response": {
+        "missing_parent": [
+          "06ab03b96a046f60527eab4781a1f00c",
+          "075403a44e3517ca53c5f75e6fc16db5",
+          "078d01e21125fd1a372a9fce2f2eda47",
+          "0828e0fb711bb8575df5495098b229a9",
+          "0a32321d18b8df0970527f754d9afd67",
+          "0b63b616bcf9c43cd637c6af9e7a9fd4",
+          "0e074c9b3ecc935497b383a24194dc84",
+          "0ed2d08547b372f60095a6b99431129d",
+          "1132141024deca5d1424245992faa8e1",
+          "11384a2aab580a6c13fb5ae3105fafec",
+          "1217d470e49e38ed66f2225f79ac0eee",
+          "17445d7040bb9e0c9128dfbe7f52f84e",
+          "17e689d89bca5b31aef7e8175d6ad0be",
+          "180980867b06b8d45ff000e670caa700",
+          "1df501be82da6044128b2ca115c1f314",
+          "1f276bae56b4efe7ce40c027b00af268",
+          "20131acb86510916c5a9b665623fbc4d",
+          "21c8c2fa6fcc24ffe05725e1379fa52c",
+          "239d24f4b3e6cc001eb6ce3aff1d8e81",
+          "2f0d89a1c1c8be98e6110519681074b0",
+          "32d0caa60fb42b90dde48274d4195853",
+          "34423abf68d67896a4d122ce349d21ae",
+          "345d5134a522d3d0e5a78fc7530f2891",
+          "360508fd65c2aea059b9fe9ff9c17cd4",
+          "37caaa88b732adba15cc69fcc006dae0",
+          "3d25be494efa2a0661d1c875563e3990",
+          "4024b13f3f7db1d178ec1f2148778ecb",
+          "40d1cd66075294a30a8fa84581285c35",
+          "413295173cbab662f915398448fcf9b8",
+          "41dc7daaab775c3cba9aaef39e8bca0e",
+          "48a6574566d708750d87511888191609",
+          "496755c881c3bc99fd617f7b0601d0c2",
+          "4a31751bd005c276f1717c5060f64e8e",
+          "4a795cfed1de75573ff50abcdd6cf44e",
+          "512787622e4fc7d3b61eb857d0f6f1d1",
+          "51f6a57f32c0b03bd8c17ca3d8171cb4",
+          "5411de68a6169e4e0453bb493cff4150",
+          "5819753b3871cc2fe2aa2e60518eb246",
+          "5c76813ba7849b9185e3b72d4d99c417",
+          "619dbbe6b0a4b3e7ccbdf9e3010f2db9",
+          "6270f52d9034b0d8c54112e9e30a6f69",
+          "6489202d656b188b044812ddc2bda256",
+          "6669fd465b32b78c28eb6fb0a8fdf473",
+          "682ccac16063112c4d5f1c34a641b517",
+          "6956397a26939546ecb75983ecd4d3fe",
+          "6cd8b86d744ccc13e31d2f72fa4991dd",
+          "740b2aad6a91530427ac860453b4e461",
+          "74d0024cee88717c2675c062bf346561",
+          "7742ced264ef27039887bfd23eff3289",
+          "79a2b39101085fa8a13303d17e36254e",
+          "7bc96d76a8fdbf340e0beef805a123a4",
+          "7da5d32a0d88f46e8c24933dafbcb956",
+          "84501f714f415fdc536ac8e71a216d76",
+          "855146fb1c0d86c40da35439446612d3",
+          "87a50c27bb9aec3fb55ae835be63b098",
+          "8d27d235b446724b6ee6299200456a5e",
+          "8d745b343790d94a1dbc794b699cdbaf",
+          "91c74bb7af48a31ba0d9c53d0a3d17d9",
+          "971675ebf811bf416d19e322bc704030",
+          "99ad9b8a7ee2cc48ff6b6432550e540d",
+          "9cadbabd415e47be9c8c07de68680a78",
+          "9e1542b902168a3715eac3929bfe6a94",
+          "9eed089ed974bcc2c98ef620e0c8b945",
+          "a2bfe982e08f918d82410918cdb6e287",
+          "a2c769835518ba74d75b2c23d840f1e4",
+          "a5190c1bac23f388bf88b9c5fd2f13b0",
+          "a535b97d9d58a4737b8b0e1ef6067893",
+          "a7bdbc121679686cac6be4bbf4c16ae0",
+          "a8f1ffe36ffa681c3e2a85bf7e34189d",
+          "b0ed51df2c477903f2e5fefa121a232f",
+          "b1a665d812003170d4006fc4eab0c458",
+          "b3a7b4c5af333a565180d569367b1994",
+          "b3d1478de6fc4ad38b8bcce8133e628a",
+          "b60d2684a47436e591950b76b54c0012",
+          "b646e15e9ce38f3d3da10b0c4a5986a2",
+          "bb666159fb11ac65b80190203608f13d",
+          "bcb502d673ac1e1b7bcfdec6bc6ea188",
+          "bd16ea0c74fa1af12d6a0555af05b5ab",
+          "c3d5faa20bd979a7683194e0150be982",
+          "c45949282bacc489b8e6f9d0b1c31556",
+          "c61880c45024ba29368abf2af59df8a1",
+          "c78655d8f5e42594988cd8d1179e57dc",
+          "d31802bd6efdbe55a1179cf425b06d37",
+          "d7b7ba28190644bf370148950fa3ccf2",
+          "d7c118c6811737e03b1ed6f54b6040d0",
+          "d81ec7d2cac8ce461c843238479ec02c",
+          "dc59e7274db1fc7665416ded40d8eb86",
+          "dd613fe9793bc419a4196f64ae7ec882",
+          "df51277c7de5e061f245a7564bcc0bd3",
+          "dfacd94decf071428124e494c069623a",
+          "ea50fa8bd16a3ca38ff981dffc647c84",
+          "ee2f5567df2623022c3260e7a6fcb46e",
+          "f07431d19c428ed9d8647a7fa1ed70bd",
+          "f08780055b7f62a329d11ec4ba45def8",
+          "f1d42af6b03b324be8e4b3b10f8b2944",
+          "f2ec4fc5a969bf05f0de9252b4f9d883",
+          "f5d076084fed8e4d1050c76d3d398fcb",
+          "fa1347e11e22ebc1299d054ecb32bd65",
+          "fb28aaa28b3dabe7ab91c2ba1b449042",
+          "fd818773eec7959658da97680e74e94c",
+          "fdff138a0e6e55ca1baedb9e3460701a",
+          "fe7961a544389bcced7ce57f274e0c1a",
+          "ffb14ddef62f2fbd84ecc71309e38c27"
+        ]
+      },
+      "prompt_only": {}
+    },
+    "thresholds_used": {
+      "base_rate": {
+        "corpus_base_rate": 0.12393162393162395,
+        "youden_j": 0.12393162393162394
+      },
+      "jev_own_response": {
+        "corpus_base_rate": 0.7925,
+        "youden_j": 0.9125000000000001
+      },
+      "jev_parent_response": {
+        "corpus_base_rate": 0.83875,
+        "youden_j": 0.83875
+      },
+      "jev_prompt_only": {
+        "corpus_base_rate": 0.8875,
+        "youden_j": 0.92625
+      },
+      "lexical": {
+        "corpus_base_rate": -1.8256952084884548,
+        "youden_j": -1.9055896090102606
+      }
+    },
+    "unresolved_ids": []
+  },
+  "seed": 20260109
+}

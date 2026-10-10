@@ -31,6 +31,12 @@ Two consequences shape everything below:
 - `dataset/` — experiment artifacts (labeled data, metrics, score dumps)
 - `scripts/` — experiment code (one script per stage), tests colocated as
   `*.test.*` beside the module they protect
+- `scripts/reference/` — pinned, unmodified copies of external implementations a
+  stage claims parity with (today: `jev-round-scan.py`, the jev scorer C3
+  re-runs). Do not edit them: a pinned copy's sha256 is recorded in the stage's
+  metrics artifact and its loader refuses to run on other bytes. Re-pin by
+  copying the new upstream file, updating the recorded digest, and letting the
+  parity tests decide whether this repo's copies still match.
 - `docs/` — findings and write-ups promoted to permanent artifacts
 
 Adopt semblr's shape — `scripts/` for stage code, tests beside sources,
