@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -127,6 +128,7 @@ def test_assert_anchors_rejects_frame_drift(tmp_path: Path, capsys) -> None:
     broken = {
         "corpus_size": sbr.EXPECTED_CORPUS,
         "gold_size": sbr.EXPECTED_GOLD,
+        "missing_size": sbr.EXPECTED_MISSING,
         "frame_size": sbr.EXPECTED_FRAME + 1,
     }
     with pytest.raises(SystemExit):
@@ -358,16 +360,29 @@ def test_append_guard_survives_reprocessed_todo(tmp_path: Path) -> None:
 
 
 def test_real_frame_anchor() -> None:
-    """Frame arithmetic against the committed corpus and live round store."""
+    """Issue #2's frame numbers are anchors of the *pinned snapshot*.
+
+    U1: this test used to scan the live round store, so the suite was green only
+    on a store frozen at C2's run date. The frame's missing-round-file term is
+    now the manifest's recorded ``missing_ids`` ledger, which makes the same
+    arithmetic checkable with no store present at all; a store that disagrees is
+    reported by ``check_store_drift``, it no longer moves the frame.
+    """
     if not sbr.DEFAULT_CORPUS.exists() or not sbr.DEFAULT_GOLD.exists():
         pytest.skip("committed corpus/gold artifacts not present")
-    if not sbr.DEFAULT_ROUND_STORE.exists():
-        pytest.skip("round store not present")
-    manifest = sbr.build_manifest(sample_size=1)
+    if not sbr.DEFAULT_MANIFEST.exists():
+        pytest.skip("committed sample manifest not present")
+    committed = json.loads(sbr.DEFAULT_MANIFEST.read_text(encoding="utf-8"))
+    manifest = sbr.reproduce_snapshot(committed)
     assert manifest["corpus_size"] == sbr.EXPECTED_CORPUS
     assert manifest["gold_size"] == sbr.EXPECTED_GOLD
-    assert manifest["missing_size"] == 29
+    assert manifest["missing_size"] == sbr.EXPECTED_MISSING == 29
     assert manifest["frame_size"] == sbr.EXPECTED_FRAME
+    # The anchors are the same guard the stage runs, on the reproduced frame.
+    sbr.assert_anchors(manifest)
+    assert manifest["missing_ids"] == committed["missing_ids"]
+    assert manifest["sampled_ids"] == committed["sampled_ids"]
+    assert len(manifest["sampled_ids"]) == committed["sample_size"]
 
 
 # --- unit-003: run report + backfill -----------------------------------------
@@ -818,26 +833,26 @@ def test_determinism_run_adjudication_is_reproducible() -> None:
 
 
 def test_determinism_committed_manifest_reproduces_from_seed() -> None:
-    """The committed manifest is byte-reproducible from its recorded seed.
+    """The committed manifest is byte-reproducible from seed + its own ledger.
 
-    This is the determinism obligation anchored on a committed artifact: the
-    frame+sample step re-run over the live inputs must yield the ids already
-    recorded, otherwise the seed no longer explains the sample.
+    This is the determinism obligation anchored on a committed artifact. U1 moved
+    the derivation from the live round store to the snapshot's recorded frame, so
+    the obligation now holds on a moved store — and in a clean clone with no
+    store at all — instead of only on the machine C2 ran on.
     """
     if not sbr.DEFAULT_CORPUS.exists() or not sbr.DEFAULT_GOLD.exists():
         pytest.skip("committed corpus/gold artifacts not present")
     if not sbr.DEFAULT_MANIFEST.exists():
         pytest.skip("committed sample manifest not present")
-    if not sbr.DEFAULT_ROUND_STORE.exists():
-        pytest.skip("round store not present")
-    committed = json.loads(sbr.DEFAULT_MANIFEST.read_text(encoding="utf-8"))
-    rerun = sbr.build_manifest(
-        seed=committed["seed"],
-        sample_size=committed["sample_size"],
-    )
-    assert rerun["sampled_ids"] == committed["sampled_ids"]
-    assert rerun["missing_ids"] == committed["missing_ids"]
-    assert rerun["frame_size"] == committed["frame_size"]
+    committed_bytes = sbr.DEFAULT_MANIFEST.read_bytes()
+    committed = json.loads(committed_bytes.decode("utf-8"))
+    rebuilt = sbr.reproduce_snapshot(committed)
+    assert rebuilt == committed
+    assert rebuilt["sampled_ids"] == committed["sampled_ids"]
+    assert rebuilt["missing_ids"] == committed["missing_ids"]
+    assert rebuilt["frame_size"] == committed["frame_size"]
+    # Byte-for-byte, not just field-for-field: the shipped file is the pin.
+    assert sbr.manifest_bytes(rebuilt) == committed_bytes
 
 
 def test_cross_check_frame_arithmetic_matches_fresh_computation(tmp_path: Path) -> None:
@@ -930,6 +945,411 @@ def test_cross_check_gold_never_reaches_the_frame(tmp_path: Path) -> None:
     assert set(manifest["sampled_ids"]).isdisjoint(corpus[:3])
     assert set(manifest["missing_ids"]).isdisjoint(corpus[:3])
     assert manifest["frame_size"] == len(corpus) - manifest["gold_size"]
+
+
+# --- unit-007: pinned frame snapshot, loud store drift (U1) ------------------
+
+
+def _snapshot_fixture(
+    tmp_path: Path,
+    corpus_n: int = 60,
+    gold_n: int = 5,
+    missing_n: int = 4,
+    sample_size: int = 10,
+    seed: int = 7,
+):
+    """A synthetic corpus/gold/store plus the manifest drawn from that store.
+
+    Returns ``(snapshot, store, corpus_path, gold_path)``. The last
+    ``missing_n`` corpus ids have no round file, so the ledger is non-empty; gold
+    ids all have files, so gold and missing stay disjoint and the frame is
+    ``corpus_n - gold_n - missing_n``. ``drop_ids`` is left at the module default
+    so the fixture behaves exactly like the production call path.
+    """
+    corpus = [f"id{i:03d}" for i in range(corpus_n)]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus]
+    )
+    gold_path = _write_jsonl(
+        tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:gold_n]]
+    )
+    # The absent rounds are spread through the frame, not clustered at its tail:
+    # recovering one must actually shift frame positions, or a redraw could
+    # coincidentally reproduce the same sample and the drift tests would prove
+    # nothing. Gold ids always have files, so gold and missing stay disjoint.
+    stride = (corpus_n - gold_n) // missing_n
+    missing = {corpus[gold_n + i * stride] for i in range(missing_n)}
+    store = _make_store(tmp_path, [rid for rid in corpus if rid not in missing])
+    snapshot = sbr.build_manifest(
+        seed=seed,
+        sample_size=sample_size,
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+    )
+    return snapshot, store, corpus_path, gold_path
+
+
+def _reproduce(snapshot: dict, corpus_path: Path, gold_path: Path) -> dict:
+    return sbr.reproduce_snapshot(
+        snapshot, corpus_path=corpus_path, gold_path=gold_path
+    )
+
+
+def _drift(snapshot: dict, store: Path, corpus_path: Path, gold_path: Path) -> dict:
+    return sbr.check_store_drift(
+        snapshot, round_store=store, corpus_path=corpus_path, gold_path=gold_path
+    )
+
+
+def _recover(store: Path, ids: list[str]) -> None:
+    """Simulate an upstream recovery: the round files for ``ids`` appear."""
+    for rid in ids:
+        (store / f"{rid}.json").write_text(
+            json.dumps({"userPrompt": f"recovered-{rid}"})
+        )
+
+
+def _frame_victim(
+    snapshot: dict, corpus_path: Path, gold_path: Path, store: Path
+) -> str:
+    """A frame member whose round file exists and that the sample did not draw.
+
+    Deleting one moves the frame without touching the recorded sample, which is
+    the distinction the drift check has to get right.
+    """
+    excluded = (
+        set(snapshot["missing_ids"])
+        | set(snapshot["sampled_ids"])
+        | sbr.gold_ids(gold_path)
+    )
+    for rid in sbr.corpus_ids(corpus_path):
+        if rid not in excluded and (store / f"{rid}.json").exists():
+            return rid
+    raise AssertionError("fixture must leave an unsampled round inside the frame")
+
+
+def _diverged_fields(message: str) -> list[str]:
+    """The field names a ``SnapshotError`` blames, parsed out of its message."""
+    tail = message.split("— ", 1)[1]
+    return [part.split(":", 1)[0].strip() for part in tail.split("; ")]
+
+
+# The four frame numbers as issue #2 states them. Deliberately literals rather
+# than sbr.EXPECTED_*: a test that reads the code's own anchor table cannot
+# notice an anchor being dropped from it — the F1 lesson, re-used here.
+ISSUE_TWO_FRAME = {
+    "corpus_size": 5430,
+    "gold_size": 244,
+    "missing_size": 29,
+    "frame_size": 5159,
+}
+
+
+@pytest.mark.parametrize("field", sorted(ISSUE_TWO_FRAME))
+def test_assert_anchors_names_the_field_that_drifted(field: str) -> None:
+    """Every frame anchor fails with its own field named — U1's loud failure."""
+    manifest = dict(ISSUE_TWO_FRAME)
+    manifest[field] += 1
+    with pytest.raises(SystemExit) as excinfo:
+        sbr.assert_anchors(manifest)
+    message = str(excinfo.value)
+    assert message.startswith(f"{field} drift: "), message
+    assert f"expected {ISSUE_TWO_FRAME[field]}, got {ISSUE_TWO_FRAME[field] + 1}" in message
+
+
+def test_assert_anchors_accepts_the_issue_two_numbers() -> None:
+    """Control: the pinned frame numbers satisfy the anchors untouched."""
+    sbr.assert_anchors(dict(ISSUE_TWO_FRAME))
+
+
+def test_ledger_is_the_frame_authority_not_the_store(tmp_path: Path) -> None:
+    """With the ledger recorded, no store can move the frame or the sample.
+
+    The control half of the test is what makes it discriminate: the same store
+    loss *does* move a store-derived frame, so a regression back to scanning
+    would fail here rather than silently redrawing the C2 sample.
+    """
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    ledger = snapshot["missing_ids"]
+    assert ledger, "fixture must record a non-empty ledger"
+
+    # The ledger path never reads the store: a nonexistent one reproduces it.
+    rebuilt = sbr.build_manifest(
+        seed=snapshot["seed"],
+        sample_size=snapshot["sample_size"],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=tmp_path / "no-such-store",
+        missing_ids=ledger,
+    )
+    assert rebuilt == snapshot
+
+    # Control: lose one frame round, and only the store-derived frame moves.
+    victim = _frame_victim(snapshot, corpus_path, gold_path, store)
+    (store / f"{victim}.json").unlink()
+    redrawn = sbr.build_manifest(
+        seed=snapshot["seed"],
+        sample_size=snapshot["sample_size"],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+    )
+    assert redrawn["missing_size"] == snapshot["missing_size"] + 1
+    assert redrawn["frame_size"] == snapshot["frame_size"] - 1
+    assert redrawn["sampled_ids"] != snapshot["sampled_ids"]
+    assert _reproduce(snapshot, corpus_path, gold_path) == snapshot
+
+
+def test_pinned_snapshot_survives_the_loss_of_the_whole_store(
+    tmp_path: Path,
+) -> None:
+    """Re-deriving the sample needs no round store: the ledger is the record."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    shutil.rmtree(store)
+    assert _reproduce(snapshot, corpus_path, gold_path) == snapshot
+
+
+@pytest.mark.parametrize(
+    "field, expected_named",
+    [
+        ("corpus_size", ["corpus_size"]),
+        ("gold_size", ["gold_size"]),
+        ("missing_size", ["missing_size"]),
+        ("frame_size", ["frame_size"]),
+        ("sampled_ids", ["sampled_ids"]),
+        # A shortened ledger is an *input*, so it cannot diverge from itself:
+        # what the report blames are the fields computed from it — and a wider
+        # frame draws a different sample, which is exactly the silent redraw
+        # U1 removed.
+        ("missing_ids", ["missing_size", "frame_size", "sampled_ids"]),
+    ],
+)
+def test_reproduce_snapshot_names_the_field_that_diverges(
+    tmp_path: Path, field: str, expected_named: list[str]
+) -> None:
+    """ext 7a's rule for the frame pin: a mismatch names the field it broke."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    tampered = dict(snapshot)
+    if field == "missing_ids":
+        tampered[field] = snapshot[field][1:]
+    elif field == "sampled_ids":
+        tampered[field] = list(reversed(snapshot[field]))
+    else:
+        tampered[field] = snapshot[field] + 1
+    with pytest.raises(sbr.SnapshotError) as excinfo:
+        _reproduce(tampered, corpus_path, gold_path)
+    message = str(excinfo.value)
+    assert _diverged_fields(message) == expected_named, message
+    assert "recorded" in message and "re-derived" in message
+
+
+def test_reproduce_snapshot_requires_a_complete_record(tmp_path: Path) -> None:
+    """A pre-pin manifest without a ledger fails naming what is absent."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    old_format = {"seed": snapshot["seed"], "sampled_ids": snapshot["sampled_ids"]}
+    with pytest.raises(sbr.SnapshotError) as excinfo:
+        _reproduce(old_format, corpus_path, gold_path)
+    message = str(excinfo.value)
+    assert "missing fields" in message
+    for field in ("corpus_size", "missing_ids", "frame_size"):
+        assert field in message, message
+
+
+def test_reproduce_snapshot_keeps_the_ledger_canonical(tmp_path: Path) -> None:
+    """A ledger that is not sorted-and-distinct is not the pinned ledger.
+
+    ``build_manifest`` re-canonicalises the recorded ids before comparing, so a
+    hand-reordered snapshot fails naming ``missing_ids`` instead of reproducing
+    quietly in a form the byte gate would later have to reject.
+    """
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    reversed_ledger = dict(snapshot)
+    reversed_ledger["missing_ids"] = list(reversed(snapshot["missing_ids"]))
+    with pytest.raises(sbr.SnapshotError) as excinfo:
+        _reproduce(reversed_ledger, corpus_path, gold_path)
+    assert _diverged_fields(str(excinfo.value)) == ["missing_ids"]
+
+    duplicated = dict(snapshot)
+    duplicated["missing_ids"] = sorted(
+        snapshot["missing_ids"] + snapshot["missing_ids"][:1]
+    )
+    duplicated["missing_size"] = len(duplicated["missing_ids"])
+    with pytest.raises(sbr.SnapshotError) as excinfo:
+        _reproduce(duplicated, corpus_path, gold_path)
+    # The ledger is a *set* of ids: a duplicated entry inflates the count and
+    # the recorded ledger itself, while the frame it excludes stays the same.
+    assert _diverged_fields(str(excinfo.value)) == ["missing_size", "missing_ids"]
+
+
+def test_ledger_is_sorted_whatever_order_the_corpus_arrives_in(
+    tmp_path: Path,
+) -> None:
+    """One canonical form for the ledger, whatever the corpus file looks like.
+
+    The pin's bytes must not depend on the order the ids happen to be listed in:
+    a corpus re-sorted upstream would otherwise re-draw the ledger's shape and the
+    byte gate would fire on formatting rather than on a changed sample.
+    """
+    corpus = [f"id{i:03d}" for i in range(30)][::-1]
+    corpus_path = _write_jsonl(
+        tmp_path / "corpus.jsonl", [{"id": rid} for rid in corpus]
+    )
+    gold_path = _write_jsonl(
+        tmp_path / "gold.jsonl", [{"id": rid} for rid in corpus[:3]]
+    )
+    missing = {"id004", "id005", "id006"}
+    store = _make_store(tmp_path, [rid for rid in corpus if rid not in missing])
+    snapshot = sbr.build_manifest(
+        sample_size=5, corpus_path=corpus_path, gold_path=gold_path, round_store=store
+    )
+    assert snapshot["missing_ids"] == ["id004", "id005", "id006"]
+    assert snapshot["frame_size"] == 30 - 3 - 3
+
+
+def test_check_store_drift_is_quiet_on_a_matching_store(tmp_path: Path) -> None:
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    report = _drift(snapshot, store, corpus_path, gold_path)
+    assert report["drifted_fields"] == []
+    assert report["recovered_ids"] == []
+    assert report["newly_missing_ids"] == []
+    assert report["sampled_missing_ids"] == []
+    assert report["live_frame_size"] == report["pinned_frame_size"]
+    assert report["live_missing_size"] == report["recorded_missing_size"]
+    assert "none" in sbr.drift_summary(report)
+
+
+def test_check_store_drift_names_the_fields_a_moved_store_would_move(
+    tmp_path: Path,
+) -> None:
+    """The C2 case: recovered rounds are disclosed by field name, not redrawn."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    recovered = sorted(snapshot["missing_ids"][:2])
+    _recover(store, recovered)
+    report = _drift(snapshot, store, corpus_path, gold_path)
+    assert set(report["drifted_fields"]) == {"missing_size", "missing_ids", "frame_size"}
+    assert report["recorded_missing_size"] == snapshot["missing_size"]
+    assert report["live_missing_size"] == snapshot["missing_size"] - 2
+    assert report["recovered_ids"] == recovered
+    assert report["newly_missing_ids"] == []
+    assert report["pinned_frame_size"] == snapshot["frame_size"]
+    assert report["live_frame_size"] == snapshot["frame_size"] + 2
+    summary = sbr.drift_summary(report)
+    for field in report["drifted_fields"]:
+        assert field in summary, summary
+    assert "not redrawn" in summary, summary
+
+
+def test_check_store_drift_reports_a_round_that_went_missing(
+    tmp_path: Path,
+) -> None:
+    """Loss outside the recorded sample is drift, named, but not fatal."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    victim = _frame_victim(snapshot, corpus_path, gold_path, store)
+    (store / f"{victim}.json").unlink()
+    report = _drift(snapshot, store, corpus_path, gold_path)
+    assert report["newly_missing_ids"] == [victim]
+    assert report["recovered_ids"] == []
+    assert "missing_ids" in report["drifted_fields"]
+    assert report["sampled_missing_ids"] == []
+
+
+def test_check_store_drift_fails_loudly_when_a_sampled_round_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A sampled id without a round file invalidates the pinned sample."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    victim = snapshot["sampled_ids"][0]
+    (store / f"{victim}.json").unlink()
+    with pytest.raises(sbr.StoreDriftError) as excinfo:
+        _drift(snapshot, store, corpus_path, gold_path)
+    message = str(excinfo.value)
+    assert "sampled_missing_ids" in message
+    assert victim in message
+
+
+def test_drift_never_changes_the_recorded_sample(tmp_path: Path) -> None:
+    """U1's core claim: seed + pinned snapshot beat a moved live store."""
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    _recover(store, snapshot["missing_ids"][:3])
+    assert _reproduce(snapshot, corpus_path, gold_path)["sampled_ids"] == (
+        snapshot["sampled_ids"]
+    )
+    # And the live store would have drawn something else from the wider frame.
+    widened = sbr.build_manifest(
+        seed=snapshot["seed"],
+        sample_size=snapshot["sample_size"],
+        corpus_path=corpus_path,
+        gold_path=gold_path,
+        round_store=store,
+    )
+    assert widened["frame_size"] == snapshot["frame_size"] + 3
+    assert widened["sampled_ids"] != snapshot["sampled_ids"]
+
+
+def test_manifest_bytes_are_the_pinned_serialization(tmp_path: Path) -> None:
+    """The shipped manifest equals its own canonical rendering."""
+    if not sbr.DEFAULT_MANIFEST.exists():
+        pytest.skip("committed sample manifest not present")
+    committed_bytes = sbr.DEFAULT_MANIFEST.read_bytes()
+    committed = json.loads(committed_bytes.decode("utf-8"))
+    assert sbr.manifest_bytes(committed) == committed_bytes
+    assert sbr.write_manifest(committed, tmp_path / "m.json").read_bytes() == (
+        committed_bytes
+    )
+
+
+def test_committed_snapshot_is_a_complete_pinned_record() -> None:
+    """Every field the pin needs is in the committed artifact, and consistent."""
+    if not sbr.DEFAULT_MANIFEST.exists():
+        pytest.skip("committed sample manifest not present")
+    if not sbr.DEFAULT_CORPUS.exists():
+        pytest.skip("committed corpus artifact not present")
+    committed = json.loads(sbr.DEFAULT_MANIFEST.read_text(encoding="utf-8"))
+    assert set(committed) == set(sbr.SNAPSHOT_FIELDS)
+    assert committed["missing_size"] == sbr.EXPECTED_MISSING
+    assert committed["missing_size"] == len(committed["missing_ids"])
+    # The ledger is pinned in canonical form: sorted and free of duplicates.
+    assert committed["missing_ids"] == sorted(set(committed["missing_ids"]))
+    assert committed["frame_size"] == sbr.EXPECTED_FRAME
+    assert committed["corpus_size"] == sbr.EXPECTED_CORPUS
+    assert committed["gold_size"] == sbr.EXPECTED_GOLD
+    assert len(committed["sampled_ids"]) == committed["sample_size"]
+    assert len(set(committed["sampled_ids"])) == committed["sample_size"]
+    # The ledger is a claim about corpus ids, so it must stay inside its domain.
+    assert set(committed["missing_ids"]) <= set(sbr.corpus_ids())
+    assert set(committed["sampled_ids"]).isdisjoint(committed["missing_ids"])
+
+
+def test_live_store_drift_is_named_and_leaves_the_sample_reproducible() -> None:
+    """The real moved store: 15 of the 29 recorded rounds came back upstream.
+
+    Deliberately date-independent: no live *count* is asserted (that was U1's
+    disease). What must hold on any store is that the pinned sample still
+    reproduces, that every recorded round is still adjudicable, and that
+    whatever differs is named by field.
+    """
+    if not sbr.DEFAULT_CORPUS.exists() or not sbr.DEFAULT_GOLD.exists():
+        pytest.skip("committed corpus/gold artifacts not present")
+    if not sbr.DEFAULT_MANIFEST.exists() or not sbr.DEFAULT_ROUND_STORE.exists():
+        pytest.skip("pinned manifest or round store not present")
+    committed = json.loads(sbr.DEFAULT_MANIFEST.read_bytes().decode("utf-8"))
+    report = sbr.check_store_drift(committed, round_store=sbr.DEFAULT_ROUND_STORE)
+    assert report["sampled_missing_ids"] == [], "a sampled round file is gone"
+    assert set(report["drifted_fields"]) <= {
+        "missing_size",
+        "missing_ids",
+        "frame_size",
+    }
+    assert report["recorded_missing_size"] == sbr.EXPECTED_MISSING
+    assert report["pinned_frame_size"] == sbr.EXPECTED_FRAME
+    # Set algebra over the ledger: recovered ids leave, newly missing ones join.
+    assert report["live_missing_size"] == (
+        report["recorded_missing_size"]
+        - len(report["recovered_ids"])
+        + len(report["newly_missing_ids"])
+    )
+    assert sbr.reproduce_snapshot(committed)["sampled_ids"] == committed["sampled_ids"]
 
 
 # --- unit-005: CLI wiring (--out, run_adjudication, key + cache) -------------
@@ -1134,3 +1554,139 @@ def test_cli_cache_is_persisted_after_each_row(tmp_path: Path, monkeypatch) -> N
     # ``run_adjudication`` walks the whole resume plan before consulting
     # ``min_rows`` (which only gates backfill), so all 100 sampled ids land.
     assert len(sbr.load_results(out)) == 100
+
+
+# --- unit-007: CLI wiring of the pinned snapshot (U1) ------------------------
+
+
+def _cli_snapshot_fixture(tmp_path: Path, monkeypatch):
+    """CLI args pointing at a *pinned* snapshot already written on disk.
+
+    Returns ``(argv, snapshot, store, corpus_path, gold_path, manifest_path)``.
+    ``assert_anchors`` is neutralised because the synthetic frame cannot match the
+    live 5430/244/29/5159 anchors; the snapshot path itself is the real one.
+    """
+    snapshot, store, corpus_path, gold_path = _snapshot_fixture(tmp_path)
+    monkeypatch.setattr(sbr, "assert_anchors", lambda manifest: None)
+    manifest_path = tmp_path / "manifest.json"
+    sbr.write_manifest(snapshot, manifest_path)
+    argv = [
+        "--seed", str(snapshot["seed"]),
+        "--sample-size", str(snapshot["sample_size"]),
+        "--corpus", str(corpus_path),
+        "--gold", str(gold_path),
+        "--rounds-dir", str(store),
+        "--manifest", str(manifest_path),
+    ]
+    return argv, snapshot, store, corpus_path, gold_path, manifest_path
+
+
+def test_cli_reproduces_the_pinned_snapshot_and_prints_the_drift(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A moved store on the pinned path: disclose by name, keep the sample."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    argv, snapshot, store, _, _, manifest_path = _cli_snapshot_fixture(
+        tmp_path, monkeypatch
+    )
+    before = manifest_path.read_bytes()
+    _recover(store, snapshot["missing_ids"][:2])
+    rc = sbr.main(argv + ["--manifest-only"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "store drift" in out
+    for field in ("missing_size", "missing_ids", "frame_size"):
+        assert field in out, out
+    assert "source=pinned snapshot" in out
+    assert manifest_path.read_bytes() == before, "the pinned bytes moved"
+
+
+def test_cli_fresh_manifest_path_still_draws_from_the_store(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Nothing pinned at the path: the frame is scanned, and the pin is written."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    argv, snapshot, store, _, _, manifest_path = _cli_snapshot_fixture(
+        tmp_path, monkeypatch
+    )
+    manifest_path.unlink()
+    rc = sbr.main(argv + ["--manifest-only"])
+    assert rc == 0
+    assert "source=live store scan" in capsys.readouterr().out
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert written == snapshot
+
+
+def test_cli_refuses_to_redraw_a_pinned_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The pin protects itself: a redraw needs a new manifest path."""
+    argv, snapshot, store, _, _, manifest_path = _cli_snapshot_fixture(
+        tmp_path, monkeypatch
+    )
+    before = manifest_path.read_bytes()
+    with pytest.raises(SystemExit) as excinfo:
+        sbr.main(argv + ["--manifest-only", "--redraw"])
+    message = str(excinfo.value)
+    assert "pinned snapshot" in message
+    assert "new --manifest path" in message
+    assert manifest_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "flag, field",
+    [("--seed", "seed"), ("--sample-size", "sample_size")],
+)
+def test_cli_draw_request_conflicting_with_the_pin_names_the_field(
+    tmp_path: Path, monkeypatch, flag: str, field: str
+) -> None:
+    """Asking for a different seed over a pinned snapshot is a loud error."""
+    argv, snapshot, store, _, _, manifest_path = _cli_snapshot_fixture(
+        tmp_path, monkeypatch
+    )
+    before = manifest_path.read_bytes()
+    other = "999" if flag == "--seed" else "4"
+    with pytest.raises(SystemExit) as excinfo:
+        # argparse keeps the last occurrence, so this overrides the fixture's value.
+        sbr.main(argv + [flag, other, "--manifest-only"])
+    message = str(excinfo.value)
+    assert "conflict with the pinned snapshot" in message
+    assert field in message, message
+    assert "--redraw" in message
+    assert manifest_path.read_bytes() == before
+
+
+def test_cli_snapshot_that_would_change_its_bytes_is_not_written(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same data, different bytes: refuse before writing, do not normalise it.
+
+    A hand-reformatted snapshot still reproduces as a manifest, so only the
+    byte gate keeps the committed file's identity — and it must fire *before* the
+    file is touched, or the run would rewrite history under the name of pinning.
+    """
+    argv, snapshot, store, _, _, manifest_path = _cli_snapshot_fixture(
+        tmp_path, monkeypatch
+    )
+    reformatted = json.dumps(snapshot, indent=4, ensure_ascii=False) + "\n"
+    assert reformatted.encode() != sbr.manifest_bytes(snapshot)
+    manifest_path.write_text(reformatted, encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        sbr.main(argv + ["--manifest-only"])
+    assert "would change" in str(excinfo.value)
+    assert manifest_path.read_text(encoding="utf-8") == reformatted
+
+
+def test_cli_store_that_lost_a_sampled_round_fails_loudly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The one drift the pin cannot absorb: a sampled round file is gone."""
+    argv, snapshot, store, _, _, manifest_path = _cli_snapshot_fixture(
+        tmp_path, monkeypatch
+    )
+    victim = snapshot["sampled_ids"][0]
+    (store / f"{victim}.json").unlink()
+    with pytest.raises(sbr.StoreDriftError) as excinfo:
+        sbr.main(argv + ["--manifest-only"])
+    assert "sampled_missing_ids" in str(excinfo.value)
+    assert victim in str(excinfo.value)
